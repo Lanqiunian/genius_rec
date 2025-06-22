@@ -1,81 +1,144 @@
-# src/model.py
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 
-# 辅助模块: 位置编码器 (这部分无需修改)
-class PositionalEncoder(nn.Module):
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+class HSTU_EncoderLayer(nn.Module):
+    """
+    单个HSTU编码器层，其参数名已与您的config.py对齐。
+    """
+    def __init__(self, embedding_dim, nhead, dim_feedforward, dropout=0.1, activation=F.silu):
         super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.permute(1, 0, 2) 
-        x = x + self.pe[:x.size(0)]
-        x = self.dropout(x)
-        return x.permute(1, 0, 2)
-
-# --- 核心修正点：简化HSTU_Encoder，移除sep_token_id ---
-class HSTU_Encoder(nn.Module):
-    def __init__(self, num_items: int, config: dict):
-        super().__init__()
-        self.config = config
-        self.embedding_dim = config['embedding_dim']
+        self.embedding_dim = embedding_dim
+        self.nhead = nhead
+        self.d_head = embedding_dim // nhead
         
-        self.item_embedding = nn.Embedding(num_items, self.embedding_dim, padding_idx=0)
-        self.positional_encoder = PositionalEncoder(self.embedding_dim, config['dropout'], config['max_seq_len'])
+        if self.d_head * nhead != self.embedding_dim:
+            raise ValueError(f"embedding_dim ({self.embedding_dim}) 必须是 nhead ({self.nhead}) 的整数倍")
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.embedding_dim,
-            nhead=config['nhead'],
-            dim_feedforward=config['dim_feedforward'],
-            dropout=config['dropout'],
-            activation='relu',
-            batch_first=True,
-            norm_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=config['num_encoder_layers']
-        )
-        self.init_weights()
+        # 将Q,K,V和门控U的投影合并在一个大的线性层中
+        self.in_proj = nn.Linear(embedding_dim, 2 * embedding_dim)
+        self.out_proj = nn.Linear(embedding_dim, embedding_dim)
 
-    def init_weights(self):
-        initrange = 0.1
-        self.item_embedding.weight.data.uniform_(-initrange, initrange)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.out_dropout = nn.Dropout(dropout)
+        
+        # 使用Pre-Norm结构，在操作之前进行LayerNorm
+        self.norm1 = nn.LayerNorm(embedding_dim)
+        
+        self.activation = activation
 
-    def forward(self, seq: torch.Tensor) -> torch.Tensor:
-        key_padding_mask = (seq == 0)
-        item_embed = self.item_embedding(seq) * math.sqrt(self.embedding_dim)
-        pos_embed = self.positional_encoder(item_embed)
-        output = self.transformer_encoder(pos_embed, src_key_padding_mask=key_padding_mask)
+    def forward(self, src, src_mask=None):
+        """
+        前向传播
+        :param src: (S, B, E) - S=序列长度, B=批次大小, E=embedding_dim
+        :param src_mask: (S, S) - 注意力掩码
+        """
+        S, B, E = src.shape
+        
+        x = src
+        x_norm = self.norm1(x)
+
+        proj_output = self.in_proj(x_norm)
+        proj_output_activated = self.activation(proj_output)
+        qkv, u = torch.chunk(proj_output_activated, 2, dim=-1)
+
+        q = qkv.view(S, B, self.nhead, self.d_head).permute(1, 2, 0, 3)
+        k = qkv.view(S, B, self.nhead, self.d_head).permute(1, 2, 0, 3)
+        v = qkv.view(S, B, self.nhead, self.d_head).permute(1, 2, 0, 3)
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)
+        
+        if src_mask is not None:
+            # 使用-inf进行掩码，以在激活后得到接近于0的值
+            attn_scores = attn_scores.masked_fill(src_mask == 0, float('-inf'))
+
+        attn_weights = self.activation(attn_scores)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = attn_output.permute(2, 0, 1, 3).contiguous().view(S, B, E)
+
+        gated_output = attn_output * u
+        gated_output_proj = self.out_proj(gated_output)
+
+        x = x + self.out_dropout(gated_output_proj)
+        
+        return x
+
+class HSTU_Encoder(nn.Module):
+    """
+    完整的HSTU编码器，由多个HSTU_EncoderLayer堆叠而成。
+    """
+    def __init__(self, encoder_layer, num_layers, norm=None):
+        super().__init__()
+        self.layers = nn.ModuleList([encoder_layer for _ in range(num_layers)])
+        self.num_layers = num_layers
+        self.norm = norm
+
+    def forward(self, src, mask=None):
+        output = src
+        for mod in self.layers:
+            output = mod(output, src_mask=mask)
+
+        if self.norm is not None:
+            output = self.norm(output)
         return output
 
-# --- 核心修正点：简化Standalone_HSTU_Model的初始化 ---
 class Standalone_HSTU_Model(nn.Module):
-    def __init__(self, num_items: int, config: dict):
+    """
+    用于第一阶段独立训练的完整模型，读取您的config文件。
+    """
+    def __init__(self, num_items, config):
         super().__init__()
-        # 现在这里的调用是匹配的
-        self.hstu_encoder = HSTU_Encoder(num_items, config)
+        self.config = config
+        self.num_items = num_items
 
-    def forward(self, seq: torch.Tensor) -> torch.Tensor:
-        sequence_output = self.hstu_encoder(seq)
+        # --- 从您的config字典中读取参数 ---
+        embedding_dim = config['embedding_dim']
+        nhead = config['nhead']
+        num_encoder_layers = config['num_encoder_layers']
+        dim_feedforward = config['dim_feedforward']
+        dropout = config['dropout']
+        max_seq_len = config['max_seq_len']
+
+        # --- 模型层定义 ---
+        self.item_embedding = nn.Embedding(num_items + 1, embedding_dim, padding_idx=config['pad_token_id'])
+        self.positional_encoding = nn.Parameter(torch.zeros(max_seq_len, 1, embedding_dim))
         
-        # 为了预测，我们只取序列中最后一个有效（非padding）物品的表征
-        # 一个简单但有效的近似是直接取最后一个时间步的输出
-        # 注意: DataLoader送出的batch中，每个序列的有效长度可能不同
-        # 在更精细的实现中，需要根据每个序列的真实长度来提取对应的表征
-        last_item_representation = sequence_output[:, -1, :]
+        # 实例化HSTU层
+        hstu_layer = HSTU_EncoderLayer(
+            embedding_dim=embedding_dim,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout
+        )
         
-        item_embeddings = self.hstu_encoder.item_embedding.weight
-        scores = torch.matmul(last_item_representation, item_embeddings.T)
+        # 实例化HSTU编码器，并在最后添加一个LayerNorm
+        self.hstu_encoder = HSTU_Encoder(
+            encoder_layer=hstu_layer,
+            num_layers=num_encoder_layers,
+            norm=nn.LayerNorm(embedding_dim)
+        )
+
+        self.output_layer = nn.Linear(embedding_dim, num_items + 1)
+
+    def forward(self, input_seq):
+        # input_seq: (B, S)
         
-        return scores
+        embedded = self.item_embedding(input_seq)
+        embedded = embedded.permute(1, 0, 2)  # (S, B, E)
+        
+        seq_len = embedded.size(0)
+        # 注意: 截取与当前输入序列长度匹配的位置编码
+        src = embedded + self.positional_encoding[:seq_len, :]
+        
+        # 创建causal mask (后续掩码)
+        attn_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(self.config['device'])
+        
+        encoded = self.hstu_encoder(src, mask=attn_mask) # (S, B, E)
+        encoded = encoded.permute(1, 0, 2) # (B, S, E)
+        
+        logits = self.output_layer(encoded) # (B, S, num_items+1)
+        
+        return logits

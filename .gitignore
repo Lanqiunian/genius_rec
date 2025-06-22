@@ -1,0 +1,10 @@
+data/
+checkpoint/
+
+.env
+.vscode/
+.git/
+
+*.pyc
+__pycache__/
+*.log

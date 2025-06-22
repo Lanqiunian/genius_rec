@@ -1,5 +1,5 @@
 data/
-checkpoint/
+checkpoints/
 
 .env
 .vscode/

@@ -8,3 +8,4 @@ checkpoints/
 *.pyc
 __pycache__/
 *.log
+*.ckpt

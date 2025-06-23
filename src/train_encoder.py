@@ -1,4 +1,5 @@
 # src/train_encoder.py
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -14,65 +15,6 @@ from .dataset import HSTUDataset
 from .model import Standalone_HSTU_Model
 from .evaluate_encoder import evaluate_model
 from .config import get_config
-
-def main():
-    # 1. 获取配置
-    config = get_config()
-    
-    # 设置日志
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(config['log_file']),
-            logging.StreamHandler()
-        ]
-    )
-
-    # 2. 加载预处理好的数据
-    logging.info(f"从 {config['processed_data_path']} 加载数据...")
-    try:
-        with open(config['processed_data_path'], 'rb') as f:
-            data = pickle.load(f)
-    except FileNotFoundError:
-        logging.error(f"错误: 未找到预处理数据文件 {config['processed_data_path']}。请先运行 preprocess.py。")
-        return
-
-    user_sequences = data['user_sequences']
-    
-    # 3. 动态填充配置项
-    # 我们的物品ID从1开始，0是padding，所以总的物品数是 data['num_items']
-    # 嵌入层的总大小需要是 data['num_items'] + 1
-    config['num_items'] = data['num_items'] + 1
-    model_vocab_size = config['num_items']
-
-    # 4. 划分数据集
-    logging.info("正在划分训练、验证、测试集...")
-    train_val_sequences, test_sequences = train_test_split(
-        user_sequences, test_size=0.1, random_state=42
-    )
-    train_sequences, val_sequences = train_test_split(
-        train_val_sequences, test_size=1/9, random_state=42
-    )
-    logging.info(f"数据集划分完成: 训练集 {len(train_sequences)}, 验证集 {len(val_sequences)}, 测试集 {len(test_sequences)}")
-
-    # 5. 创建Dataset和DataLoader
-    logging.info("正在创建DataLoaders...")
-    train_dataset = HSTUDataset(train_sequences, config)
-    val_dataset = HSTUDataset(val_sequences, config)
-    test_dataset = HSTUDataset(test_sequences, config)
-
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=config['num_workers'])
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=config['num_workers'])
-    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=config['num_workers'])
-
-    # 6. 实例化模型
-    # --- 核心修正点：调用现在是匹配的 ---
-    model = Standalone_HSTU_Model(model_vocab_size, config)
-    
-    # 7. 实例化并启动Trainer
-    trainer = Trainer(config, model, train_loader, val_loader, test_loader)
-    trainer.train()
 
 # Trainer 类的实现保持不变
 class Trainer:
@@ -96,6 +38,9 @@ class Trainer:
         self.best_ndcg = -1.0
         self.checkpoint_dir = Path(config['checkpoint_dir'])
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.epochs_no_improve = 0
+        self.patience = config.get('early_stopping_patience', 5)
 
     def _train_epoch(self):
         self.model.train()
@@ -110,6 +55,7 @@ class Trainer:
             scores = self.model(input_seq)
             loss = self.criterion(scores, target)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
             
             total_loss += loss.item()
@@ -118,7 +64,7 @@ class Trainer:
         return total_loss / len(self.train_loader)
 
     def train(self):
-        logging.info("开始训练 HSTU 编码器...")
+        # logging.info(f"开始训练, 配置: learning_rate={self.config['learning_rate']:.5f}, dropout={self.config['dropout']:.2f}, nhead={self.config['nhead']}")
         start_time = time.time()
 
         for epoch in range(self.config['num_epochs']):
@@ -126,51 +72,90 @@ class Trainer:
             train_loss = self._train_epoch()
             
             val_metrics = evaluate_model(self.model, self.val_loader, self.device, self.config['top_k'])
-            val_recall = val_metrics[f'Recall@{self.config["top_k"]}']
             val_ndcg = val_metrics[f'NDCG@{self.config["top_k"]}']
-            
-            elapsed_time = time.time() - start_time
             
             logging.info(
                 f"Epoch {epoch+1}/{self.config['num_epochs']} | "
                 f"训练损失: {train_loss:.4f} | "
-                f"验证 Recall@{self.config['top_k']}: {val_recall:.4f} | "
-                f"验证 NDCG@{self.config['top_k']}: {val_ndcg:.4f} | "
-                f"用时: {elapsed_time:.2f}s"
+                f"验证 NDCG@{self.config['top_k']}: {val_ndcg:.4f}"
             )
 
             if val_ndcg > self.best_ndcg:
                 self.best_ndcg = val_ndcg
+                self.epochs_no_improve = 0
                 checkpoint_path = self.checkpoint_dir / "best_model.ckpt"
-                
                 torch.save({
                     'epoch': epoch + 1,
-                    'model_state_dict': self.model.hstu_encoder.state_dict(),
+                    'model_state_dict': self.model.state_dict(),
                     'best_ndcg': self.best_ndcg,
                     'config': self.config
                 }, checkpoint_path)
-                
-                logging.info(f"在Epoch {epoch+1} 找到更优模型 (NDCG={val_ndcg:.4f})，已保存到 {checkpoint_path}")
+                logging.info(f"找到更优模型 (NDCG={val_ndcg:.4f})，已保存。")
+            else:
+                self.epochs_no_improve += 1
+                if self.epochs_no_improve >= self.patience:
+                    logging.info(f"验证集性能连续 {self.patience} 轮未提升，提前停止训练。")
+                    break 
 
-        logging.info("训练完成！")
-        
-        logging.info("在测试集上进行最终评估...")
-        best_model_path = self.checkpoint_dir / "best_model.ckpt"
-        if best_model_path.exists():
-            final_model = Standalone_HSTU_Model(
-                self.config['num_items'],
-                self.config
-            ).to(self.device)
-            checkpoint = torch.load(best_model_path)
-            final_model.hstu_encoder.load_state_dict(checkpoint['model_state_dict'])
-            logging.info(f"已加载最佳模型: {best_model_path}")
+        logging.info(f"训练完成！最佳验证NDCG: {self.best_ndcg:.4f}")
+        return self.best_ndcg
 
-            test_metrics = evaluate_model(final_model, self.test_loader, self.device, self.config['top_k'])
-            logging.info(f"最终测试集评估结果: ")
-            for metric, value in test_metrics.items():
-                logging.info(f"  {metric}: {value:.4f}")
-        else:
-            logging.warning("未找到最佳模型checkpoint，无法进行最终评估。")
+# --- 核心修复点在这里 ---
+def main(config_override=None):
+    # 1. 获取配置
+    # 如果有外部传入的配置（来自调优脚本），则使用它
+    if config_override:
+        config = config_override
+    # 否则，加载默认配置
+    else:
+        config = get_config()
+    
+    # 设置日志
+    log_file_path = Path(config['log_file'])
+    log_file_path.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file_path, mode='w'),
+            logging.StreamHandler()
+        ],
+        force=True
+    )
+    
+    # 2. 加载预处理好的数据
+    logging.info(f"从 {config['processed_data_path']} 加载数据...")
+    with open(config['processed_data_path'], 'rb') as f:
+        data = pickle.load(f)
+    
+    user_sequences = data['user_sequences']
+    
+    # 3. 确定词汇表大小
+    model_vocab_size = data['num_items'] + 1
+    # 将真实的物品数量（不含padding）保存到config，方便后续使用
+    config['num_items'] = data['num_items']
+
+    # 4. 划分数据集
+    logging.info("正在划分训练、验证、测试集...")
+    train_val_sequences, test_sequences = train_test_split(user_sequences, test_size=0.1, random_state=42)
+    train_sequences, val_sequences = train_test_split(train_val_sequences, test_size=1/9, random_state=42)
+    
+    # 5. 创建Dataset和DataLoader
+    logging.info("正在创建DataLoaders...")
+    train_dataset = HSTUDataset(train_sequences, config)
+    val_dataset = HSTUDataset(val_sequences, config)
+    
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=config['num_workers'])
+    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=config['num_workers'])
+
+    # 6. 实例化模型
+    model = Standalone_HSTU_Model(model_vocab_size, config)
+    
+    # 7. 实例化并启动Trainer
+    # 我们在调优时不需要测试集，所以最后一个参数传None
+    trainer = Trainer(config, model, train_loader, val_loader, None)
+    best_ndcg = trainer.train()
+    return best_ndcg
 
 if __name__ == '__main__':
     main()

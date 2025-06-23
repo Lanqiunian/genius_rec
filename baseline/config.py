@@ -40,8 +40,7 @@ def get_config():
         "learning_rate": 0.001,    # 学习率
         "weight_decay": 0.0,       # 权重衰减 (L2正则化)
         "num_workers": 4,          # DataLoader使用的工作进程数，可以加快数据加载
-        "early_stopping_patience": 5,  # 新增：如果验证集NDCG连续5轮没有提升，则提前停止训练
-
+        
         # --- 5. 评估参数 ---
         "top_k": 10,               # 计算Recall@K和NDCG@K时的K值
 

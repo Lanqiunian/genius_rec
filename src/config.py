@@ -27,7 +27,7 @@ def get_config():
 
         # --- 3. 模型超参数 ---
         "embedding_dim": 128,      # 物品嵌入向量的维度
-        "max_seq_len": 100,        # 输入给模型的序列最大长度
+        "max_seq_len": 200,        # 输入给模型的序列最大长度
         "num_encoder_layers": 4,   # HSTU编码器中Transformer层的数量
         "nhead": 4,                # Transformer中的多头注意力头数 (必须能被embedding_dim整除)
         "dim_feedforward": 512,    # Transformer中前馈网络的隐藏层维度

@@ -1,132 +1,214 @@
-# src/model.py
+# src/model.py (完全对齐官方HSTU实现)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+import numpy as np
+# 【新增】导入checkpoint功能
+from torch.utils.checkpoint import checkpoint
 
-class HSTU_EncoderLayer(nn.Module):
-    """
-    单个HSTU编码器层。
-    此版本经过优化，解决了数值稳定性问题，并为最高速度而设计。
-    """
-    def __init__(self, embedding_dim, nhead, dim_feedforward, dropout=0.1, activation=F.silu):
+class RelativePositionalBias(nn.Module):
+    """官方的相对位置偏置实现"""
+    def __init__(self, max_seq_len: int, num_heads: int) -> None:
         super().__init__()
-        self.embedding_dim = embedding_dim
-        self.nhead = nhead
-        self.d_head = embedding_dim // nhead
-        if self.d_head * nhead != self.embedding_dim:
-            raise ValueError(f"embedding_dim ({self.embedding_dim}) 必须是 nhead ({self.nhead}) 的整数倍")
-
-        self.in_proj = nn.Linear(embedding_dim, 2 * embedding_dim)
-        self.out_proj = nn.Linear(embedding_dim, embedding_dim)
-        self.attn_dropout = nn.Dropout(dropout)
-        self.out_dropout = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(embedding_dim)
-        self.activation = activation
-
-    def forward(self, src, src_mask=None):
-        S, B, E = src.shape
-        x = src
-        x_norm = self.norm1(x)
-        
-        proj_output = self.in_proj(x_norm)
-        proj_output_activated = self.activation(proj_output)
-        qkv, u = torch.chunk(proj_output_activated, 2, dim=-1)
-        
-        q = qkv.view(S, B, self.nhead, self.d_head).permute(1, 2, 0, 3)
-        k = qkv.view(S, B, self.nhead, self.d_head).permute(1, 2, 0, 3)
-        v = qkv.view(S, B, self.nhead, self.d_head).permute(1, 2, 0, 3)
-        
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)
-        
-        if src_mask is not None:
-            # 关键修复: 使用很大的负数而非-inf，防止SiLU激活函数计算出NaN
-            attn_scores = attn_scores.masked_fill(src_mask == 0, -1e9)
-
-        attn_weights = self.activation(attn_scores)
-        attn_weights = self.attn_dropout(attn_weights)
-        
-        attn_output = torch.matmul(attn_weights, v)
-        attn_output = attn_output.permute(2, 0, 1, 3).contiguous().view(S, B, E)
-        
-        gated_output = attn_output * u
-        gated_output_proj = self.out_proj(gated_output)
-        
-        x = x + self.out_dropout(gated_output_proj)
-        
-        return x
-
-class HSTU_Encoder(nn.Module):
-    """
-    完整的HSTU编码器，此版本不使用梯度检查点，以实现最高训练速度。
-    """
-    def __init__(self, encoder_layer, num_layers, norm=None):
-        super().__init__()
-        self.layers = nn.ModuleList([encoder_layer for _ in range(num_layers)])
-        self.num_layers = num_layers
-        self.norm = norm
-        
-    def forward(self, src, mask=None):
-        output = src
-        for mod in self.layers:
-            output = mod(output, src_mask=mask)
-
-        if self.norm is not None:
-            output = self.norm(output)
-        return output
-
-class Standalone_HSTU_Model(nn.Module):
-    """
-    最终版：与Baseline对齐，优先保证训练速度，并修复了所有已知问题。
-    """
-    def __init__(self, num_items, config):
-        super().__init__()
-        self.config = config
-        
-        embedding_dim = config['embedding_dim']
-        nhead = config['nhead']
-        num_encoder_layers = config['num_encoder_layers']
-        dim_feedforward = config['dim_feedforward']
-        dropout = config['dropout']
-        max_seq_len = config['max_seq_len']
-        self.embedding_dim = embedding_dim 
-        
-        # 关键修复：直接使用传递进来的num_items作为词汇表大小
-        self.item_embedding = nn.Embedding(num_items, embedding_dim, padding_idx=config['pad_token_id'])
-        self.positional_encoding = nn.Parameter(torch.zeros(max_seq_len, 1, embedding_dim))
-        
-        hstu_layer = HSTU_EncoderLayer(
-            embedding_dim=embedding_dim,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout
+        self._max_seq_len = max_seq_len
+        self._w = nn.Parameter(
+            torch.empty(2 * max_seq_len - 1, num_heads).normal_(mean=0, std=0.02)
         )
-        self.hstu_encoder = HSTU_Encoder(
-            encoder_layer=hstu_layer,
-            num_layers=num_encoder_layers,
-            norm=nn.LayerNorm(embedding_dim)
+
+    def forward(self, seq_len: int) -> torch.Tensor:
+        """返回 [num_heads, seq_len, seq_len] 的相对位置偏置"""
+        n = min(seq_len, self._max_seq_len)
+        
+        # 简化的相对位置偏置实现，避免复杂的Toeplitz矩阵
+        # 直接根据相对位置索引获取偏置
+        device = self._w.device
+        
+        # 创建相对位置索引矩阵
+        q_indices = torch.arange(n, device=device)[:, None]  # [n, 1]
+        k_indices = torch.arange(n, device=device)[None, :]  # [1, n]
+        relative_indices = k_indices - q_indices + (self._max_seq_len - 1)  # [n, n]
+        
+        # 确保索引在有效范围内
+        relative_indices = torch.clamp(relative_indices, 0, 2 * self._max_seq_len - 2)
+        
+        # 根据相对位置索引获取偏置值
+        bias = self._w[relative_indices]  # [n, n, num_heads]
+        bias = bias.permute(2, 0, 1)  # [num_heads, n, n]
+        
+        # 如果序列长度超过max_seq_len，需要填充
+        if seq_len > n:
+            padding_row = torch.zeros(bias.size(0), seq_len - n, n, 
+                                    device=device, dtype=bias.dtype)
+            bias = torch.cat([bias, padding_row], dim=1)
+            
+            padding_col = torch.zeros(bias.size(0), seq_len, seq_len - n,
+                                    device=device, dtype=bias.dtype)
+            bias = torch.cat([bias, padding_col], dim=2)
+        
+        return bias
+
+class HstuBlock(nn.Module):
+    """完全对齐官方的HSTU Block实现"""
+    def __init__(self, embedding_dim: int, linear_hidden_dim: int, attention_dim: int, 
+                 num_heads: int, dropout_ratio: float = 0.1, normalization: str = "rel_bias"):
+        super(HstuBlock, self).__init__()
+        
+        self._embedding_dim = embedding_dim
+        self._linear_dim = linear_hidden_dim  
+        self._attention_dim = attention_dim
+        self._num_heads = num_heads
+        self._dropout_ratio = dropout_ratio
+        self._normalization = normalization
+        
+        # 官方的uvqk参数矩阵
+        self._uvqk = nn.Parameter(
+            torch.empty(
+                embedding_dim,
+                linear_hidden_dim * 2 * num_heads + attention_dim * num_heads * 2,
+            ).normal_(mean=0, std=0.02)
         )
         
-        self.init_weights()
+        # 输出投影
+        self._o = nn.Linear(linear_hidden_dim * num_heads, embedding_dim)
+        nn.init.xavier_uniform_(self._o.weight)
+        
+        self._eps = 1e-6
 
-    def init_weights(self):
-        initrange = 0.1
-        self.item_embedding.weight.data.uniform_(-initrange, initrange)
+    def _norm_input(self, x: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(x, normalized_shape=[self._embedding_dim], eps=self._eps)
 
-    def forward(self, input_seq):
-        embedded = self.item_embedding(input_seq)
-        embedded = embedded * math.sqrt(self.embedding_dim)
-        
-        embedded = embedded.permute(1, 0, 2)
-        seq_len = embedded.size(0)
-        src = embedded + self.positional_encoding[:seq_len, :]
-        
-        attn_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(self.config['device'])
-        
-        sequence_output = self.hstu_encoder(src, mask=attn_mask)
-        final_representation = sequence_output[-1, :, :]
-        
-        scores = torch.matmul(final_representation, self.item_embedding.weight.t())
+    def _norm_attn_output(self, x: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(x, normalized_shape=[self._linear_dim * self._num_heads], eps=self._eps)
 
-        return scores
+    def forward(self, x, rel_pos_bias, invalid_attn_mask):
+        """
+        Args:
+            x: [B, N, D]
+            rel_pos_bias: [num_heads, N, N] 
+            invalid_attn_mask: [B, N, N]
+        """
+        batch_size, seq_len, _ = x.size()
+        residual = x
+        
+        # 输入归一化
+        normed_x = self._norm_input(x.view(-1, self._embedding_dim))  # [B*N, D]
+        
+        # 线性变换 uvqk
+        batched_mm_output = torch.mm(normed_x, self._uvqk)
+        batched_mm_output = F.silu(batched_mm_output)  # 官方使用silu激活
+        
+        # 分割为 u, v, q, k
+        u, v, q, k = torch.split(
+            batched_mm_output,
+            [
+                self._linear_dim * self._num_heads,
+                self._linear_dim * self._num_heads, 
+                self._attention_dim * self._num_heads,
+                self._attention_dim * self._num_heads,
+            ],
+            dim=1,
+        )
+        
+        # reshape回batch形式
+        u = u.view(batch_size, seq_len, self._linear_dim * self._num_heads)
+        v = v.view(batch_size, seq_len, self._linear_dim * self._num_heads)
+        q = q.view(batch_size, seq_len, self._num_heads, self._attention_dim)
+        k = k.view(batch_size, seq_len, self._num_heads, self._attention_dim)
+        v_reshaped = v.view(batch_size, seq_len, self._num_heads, self._linear_dim)
+        
+        # 注意力计算
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k)  # [B, H, N, N]
+        
+        # 添加相对位置偏置
+        qk_attn = qk_attn + rel_pos_bias.unsqueeze(0)  # [B, H, N, N]
+        
+        # 官方的关键步骤：SiLU激活
+        qk_attn = F.silu(qk_attn) 
+        
+        # 应用attention mask
+        qk_attn = qk_attn * invalid_attn_mask.unsqueeze(1)
+        
+        # 计算attention输出
+        attn_output = torch.einsum("bhnm,bmhd->bnhd", qk_attn, v_reshaped)
+        attn_output = attn_output.reshape(batch_size, seq_len, self._linear_dim * self._num_heads)
+        
+        # 归一化attention输出
+        norm_attn_output = self._norm_attn_output(attn_output.view(-1, self._linear_dim * self._num_heads))
+        norm_attn_output = norm_attn_output.view(batch_size, seq_len, -1)
+        
+        # 门控机制：u * normalized_attention_output
+        gated_output = u * norm_attn_output
+        
+        # 输出投影
+        output = self._o(F.dropout(gated_output.view(-1, self._linear_dim * self._num_heads), 
+                                  p=self._dropout_ratio, training=self.training))
+        output = output.view(batch_size, seq_len, self._embedding_dim)
+        
+        # 残差连接
+        return residual + output
+
+class Hstu(nn.Module):
+    """完全对齐官方的HSTU模型"""
+    def __init__(self, item_num, embedding_dim=128, linear_hidden_dim=128, attention_dim=64,
+                 num_heads=8, num_layers=4, max_len=50, dropout=0.1, pad_token_id=0):
+        super(Hstu, self).__init__()
+        
+        self.item_embedding = nn.Embedding(item_num + 1, embedding_dim, padding_idx=pad_token_id)
+        self.max_len = max_len
+        self.pad_token_id = pad_token_id
+        
+        # 相对位置偏置
+        self.relative_pos_bias = RelativePositionalBias(max_len, num_heads)
+        
+        # HSTU层
+        self.encoder_layers = nn.ModuleList([
+            HstuBlock(
+                embedding_dim=embedding_dim,
+                linear_hidden_dim=linear_hidden_dim,
+                attention_dim=attention_dim,
+                num_heads=num_heads,
+                dropout_ratio=dropout
+            ) for _ in range(num_layers)
+        ])
+        
+        # 最终归一化
+        self.final_norm = nn.LayerNorm(embedding_dim)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: [B, L] item ids
+        Returns:
+            [B, L, D] sequence representations
+        """
+        batch_size, seq_len = x.size()
+        
+        # 创建causal mask
+        invalid_attn_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device))
+        invalid_attn_mask = invalid_attn_mask.unsqueeze(0).expand(batch_size, -1, -1)  # [B, L, L]
+        
+        # 物品嵌入
+        item_emb = self.item_embedding(x)  # [B, L, D]
+        input_emb = self.dropout(item_emb)
+        
+        # 相对位置偏置
+        rel_pos_bias = self.relative_pos_bias(seq_len)  # [H, L, L]
+        
+        # 通过HSTU层
+        encoded_seq = input_emb
+        for layer in self.encoder_layers:
+            encoded_seq = checkpoint(layer, encoded_seq, rel_pos_bias, invalid_attn_mask, use_reentrant=False)
+        
+        # 最终归一化
+        encoded_seq = self.final_norm(encoded_seq)
+        return encoded_seq
+
+    def predict(self, item_seq, item_candidates):
+        """用于评估的预测函数"""
+        log_feats = self.forward(item_seq)
+        final_feat = log_feats[:, -1, :]  # [B, D]
+        item_embs = self.item_embedding(item_candidates)  # [B, num_candidates, D]
+        logits = torch.bmm(final_feat.unsqueeze(1), item_embs.transpose(1, 2)).squeeze(1)
+        return logits

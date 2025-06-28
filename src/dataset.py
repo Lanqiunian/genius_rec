@@ -1,67 +1,69 @@
-# src/dataset.py
+# src/dataset.py (修正版)
 
 import torch
-from torch.utils.data import Dataset
+import torch.utils.data as data
+import pandas as pd
 import numpy as np
-from tqdm import tqdm
-import logging  # <--- 修正点：在这里添加了这行导入语句
+import pickle
 
-class HSTUDataset(Dataset):
-    """
-    为HSTU模型准备训练、验证和测试数据的Dataset类。(修正版)
-    
-    核心思想:
-    1. 直接使用由preprocess.py生成的、每个用户的单一完整交互序列。
-    2. 使用滑动窗口在长序列上生成多个 (输入序列, 目标物品) 的训练样本。
-    3. 在 __getitem__ 中对每个样本进行截断和左侧填充，使其长度统一。
-    """
-    def __init__(self, data: list, config: dict):
-        """
-        Args:
-            data (list): 预处理好的数据，格式为: 
-                         [{'user_id': int, 'sequence': [item_id, ...]}, ...]
-            config (dict): 配置字典，需要包含 'max_seq_len'。
-        """
-        super().__init__()
-        self.max_seq_len = config['max_seq_len']
-        
-        self.samples = []
+class RecDataset(data.Dataset):
+    def __init__(self, data_path, id_maps_path, max_seq_len, num_neg_samples=100, mode='train'):
+        self.data = pd.read_parquet(data_path)
+        self.max_seq_len = max_seq_len
+        self.num_neg_samples = num_neg_samples
+        self.mode = mode
 
-        logging.info("正在准备训练样本...")
-        progress_bar = tqdm(data, desc="准备样本")
-        for user_data in progress_bar:
-            long_sequence = user_data['sequence']
-
-            if len(long_sequence) < 2:
-                continue
+        with open(id_maps_path, 'rb') as f:
+            id_maps = pickle.load(f)
             
-            for i in range(1, len(long_sequence)):
-                input_seq = long_sequence[:i]
-                target_item = long_sequence[i]
-                
-                self.samples.append({
-                    "input": input_seq,
-                    "target": target_item
-                })
-        
-        logging.info(f"样本准备完成，共计 {len(self.samples)} 个样本。")
+            # 【关键修正】直接使用'num_items'键来获取物品总数
+            self.item_num = id_maps['num_items']
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.data)
 
-    def __getitem__(self, index: int) -> dict:
-        sample = self.samples[index]
-        input_seq = sample['input']
-        target_item = sample['target']
+    def __getitem__(self, idx):
+        item_seq = self.data.iloc[idx]['history']
 
-        padded_input = np.zeros(self.max_seq_len, dtype=np.int64)
-        
-        truncated_input = input_seq[-self.max_seq_len:]
-        
-        start_index = self.max_seq_len - len(truncated_input)
-        padded_input[start_index:] = truncated_input
-        
-        return {
-            "input_seq": torch.tensor(padded_input, dtype=torch.long),
-            "target": torch.tensor(target_item, dtype=torch.long)
-        }
+        if self.mode == 'train':
+            # 模式一：N-to-N 训练
+            input_ids = np.zeros(self.max_seq_len, dtype=np.int32)
+            target_ids = np.zeros(self.max_seq_len, dtype=np.int32)
+            
+            # 从序列末尾截取，保证数据最新
+            end_idx = len(item_seq)
+            start_idx = max(0, end_idx - self.max_seq_len)
+            
+            seq_slice = item_seq[start_idx:end_idx]
+            
+            # 填充到max_seq_len
+            input_ids[-len(seq_slice)+1:] = seq_slice[:-1]
+            target_ids[-len(seq_slice)+1:] = seq_slice[1:]
+            
+            return torch.LongTensor(input_ids), torch.LongTensor(target_ids)
+
+        else:
+            # 模式二：Leave-One-Out 验证/测试
+            input_seq = item_seq[:-1]
+            
+            # 截断
+            if len(input_seq) > self.max_seq_len:
+                input_seq = input_seq[-self.max_seq_len:]
+            
+            input_ids = np.zeros(self.max_seq_len, dtype=np.int32)
+            input_ids[-len(input_seq):] = input_seq
+            
+            positive_item = item_seq[-1]
+            
+            negative_samples = []
+            while len(negative_samples) < self.num_neg_samples:
+                # 【修正】randint上界是开区间，所以要+1才能包含item_num
+                neg_candidate = np.random.randint(1, self.item_num + 1)
+                if neg_candidate != positive_item and neg_candidate not in item_seq:
+                    negative_samples.append(neg_candidate)
+            
+            return (
+                torch.LongTensor(input_ids),
+                torch.LongTensor([positive_item]),
+                torch.LongTensor(negative_samples)
+            )

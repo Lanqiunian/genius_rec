@@ -15,55 +15,61 @@ class RecDataset(data.Dataset):
 
         with open(id_maps_path, 'rb') as f:
             id_maps = pickle.load(f)
-            
-            # 【关键修正】直接使用'num_items'键来获取物品总数
             self.item_num = id_maps['num_items']
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
+        # 原始的完整序列
         item_seq = self.data.iloc[idx]['history']
 
         if self.mode == 'train':
-            # 模式一：N-to-N 训练
-            input_ids = np.zeros(self.max_seq_len, dtype=np.int32)
-            target_ids = np.zeros(self.max_seq_len, dtype=np.int32)
-            
-            # 从序列末尾截取，保证数据最新
-            end_idx = len(item_seq)
-            start_idx = max(0, end_idx - self.max_seq_len)
-            
-            seq_slice = item_seq[start_idx:end_idx]
-            
-            # 填充到max_seq_len
-            input_ids[-len(seq_slice)+1:] = seq_slice[:-1]
-            target_ids[-len(seq_slice)+1:] = seq_slice[1:]
-            
-            return torch.LongTensor(input_ids), torch.LongTensor(target_ids)
+            # --- 训练模式逻辑修正 ---
+            # 为了进行next-item预测, 我们需要至少2个物品
+            if len(item_seq) < 2:
+                # 返回空的/全零的张量，可以在训练循环中过滤掉
+                return torch.zeros(self.max_seq_len, dtype=torch.long), torch.zeros(self.max_seq_len, dtype=torch.long)
 
-        else:
-            # 模式二：Leave-One-Out 验证/测试
+            # 截取最后的 max_len+1 个物品用于构建输入和目标
+            seq = item_seq[-(self.max_seq_len + 1):]
+            
+            # input是序列到倒数第二个，target是序列从第二个到最后一个
+            input_ids = seq[:-1]
+            target_ids = seq[1:]
+            
+            # 获取实际长度
+            seq_len = len(input_ids)
+            
+            # 创建全零的模板
+            padded_input = np.zeros(self.max_seq_len, dtype=np.int32)
+            padded_target = np.zeros(self.max_seq_len, dtype=np.int32) # padding target也是0
+            
+            # 从右侧填充
+            padded_input[-seq_len:] = input_ids
+            padded_target[-seq_len:] = target_ids
+            
+            return torch.LongTensor(padded_input), torch.LongTensor(padded_target)
+
+        else: # 验证/测试模式逻辑保持不变，因为它是leave-one-out，没有这个问题
             input_seq = item_seq[:-1]
             
-            # 截断
             if len(input_seq) > self.max_seq_len:
                 input_seq = input_seq[-self.max_seq_len:]
             
-            input_ids = np.zeros(self.max_seq_len, dtype=np.int32)
-            input_ids[-len(input_seq):] = input_seq
+            padded_input = np.zeros(self.max_seq_len, dtype=np.int32)
+            padded_input[-len(input_seq):] = input_seq
             
             positive_item = item_seq[-1]
             
             negative_samples = []
             while len(negative_samples) < self.num_neg_samples:
-                # 【修正】randint上界是开区间，所以要+1才能包含item_num
                 neg_candidate = np.random.randint(1, self.item_num + 1)
                 if neg_candidate != positive_item and neg_candidate not in item_seq:
                     negative_samples.append(neg_candidate)
             
             return (
-                torch.LongTensor(input_ids),
+                torch.LongTensor(padded_input),
                 torch.LongTensor([positive_item]),
                 torch.LongTensor(negative_samples)
             )

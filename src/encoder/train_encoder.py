@@ -211,18 +211,25 @@ def train():
         model.train()
         total_loss = 0.0
         train_bar = tqdm(train_loader, desc=f"训练 Epoch {epoch}")
-        
+        # train_encoder.py (正确的训练循环部分)
+
         for input_ids, target_ids in train_bar:
             input_ids, target_ids = input_ids.to(device), target_ids.to(device)
             optimizer.zero_grad()
             
+            # 1. 直接将dataset产出的input_ids喂给模型
             sequence_output = model(input_ids)
-            output_embeddings = sequence_output[:, :-1, :]
-            supervision_ids = target_ids[:, 1:]
+            
+            # 2. 【关键】不再对输出和目标进行任何切片操作
+            output_embeddings = sequence_output
+            supervision_ids = target_ids
+            
+            # 3. 权重掩码会自然地处理padding部分
             supervision_weights = (supervision_ids != config['pad_token_id']).float()
             
+            # 4. 将对齐好的数据送入损失函数
             loss = criterion(output_embeddings, supervision_ids, 
-                           model.item_embedding.weight, supervision_weights)
+                        model.item_embedding.weight, supervision_weights)
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -230,7 +237,6 @@ def train():
             
             total_loss += loss.item()
             train_bar.set_postfix(loss=loss.item())
-
         avg_train_loss = total_loss / len(train_loader)
         logging.info(f"Epoch {epoch} 平均训练损失: {avg_train_loss:.4f}")
 

@@ -306,19 +306,19 @@ def train():
             input_ids, target_ids = input_ids.to(device), target_ids.to(device)
             optimizer.zero_grad()
             
-            # 模型前向传播 - 输入序列的所有位置
-            sequence_output = model(input_ids)  # [B, L, D]
+            # 1. 直接将dataset产出的input_ids喂给模型
+            sequence_output = model(input_ids)
             
-            # 与HSTU相同的监督方式：前L-1个位置的输出预测后L-1个位置的目标
-            output_embeddings = sequence_output[:, :-1, :]  # [B, L-1, D]
-            supervision_ids = target_ids[:, 1:]  # [B, L-1] 目标是往后偏移一位
+            # 2. 【关键】不再对输出和目标进行任何切片操作
+            output_embeddings = sequence_output
+            supervision_ids = target_ids
             
-            # 计算supervision权重（排除padding）
+            # 3. 权重掩码会自然地处理padding部分
             supervision_weights = (supervision_ids != config['pad_token_id']).float()
             
-            # Sampled Softmax损失
+            # 4. 将对齐好的数据送入损失函数
             loss = criterion(output_embeddings, supervision_ids, 
-                           model.item_embedding.weight, supervision_weights)
+                        model.item_embedding.weight, supervision_weights)
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

@@ -1,5 +1,3 @@
-# train_official.py (支持断点续传的版本)
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,10 +9,9 @@ import pickle
 import logging
 import numpy as np
 
-# 使用模块化导入
+
 from src.config import get_config
-# from src.improved_hstu import HSTU as Hstu 
-from src.encoder.encoder import Hstu  # 原版模型
+from src.encoder.encoder import Hstu
 from src.encoder.dataset4encoder import RecDataset 
 
 def set_seed(seed):

@@ -1,5 +1,3 @@
-# src/config.py (重构版)
-
 import torch
 from pathlib import Path
 
@@ -63,11 +61,11 @@ def get_config():
         # --- 阶段一: 编码器预训练配置 ---
         "pretrain": {
             "log_file": "pretrain_encoder.log",
-            "num_epochs": 50,         
+            "num_epochs": 501,         
             "batch_size": 256,         
             "learning_rate": 1e-3,
             "weight_decay": 0,
-            "early_stopping_patience": 10,
+            "early_stopping_patience": 20,
             "num_workers": 10,
             "num_neg_samples": 512, # 负采样数量
             "temperature": 0.05,    # Sampled Softmax温度

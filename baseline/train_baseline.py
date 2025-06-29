@@ -13,7 +13,7 @@ import numpy as np
 
 # 使用主项目的配置和数据集
 from src.config import get_config
-from src.dataset import RecDataset 
+from src.encoder.dataset4encoder import RecDataset 
 
 def set_seed(seed):
     """设置随机种子以确保结果可复现"""
@@ -237,53 +237,55 @@ class BaselineTransformer(nn.Module):
 def train():
     config = get_config()
     
-    config['checkpoint_dir'].mkdir(parents=True, exist_ok=True)
+    config['data']['checkpoint_dir'].mkdir(parents=True, exist_ok=True)
+    config['data']['log_dir'].mkdir(parents=True, exist_ok=True)
     
+    log_file = config['data']['log_dir'] / 'baseline_training.log'
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s - %(levelname)s - %(message)s',
-                        handlers=[logging.FileHandler(config['log_file']), logging.StreamHandler()])
+                        handlers=[logging.FileHandler(log_file), logging.StreamHandler()])
     
     set_seed(config['seed'])
     device = torch.device(config['device'])
     logging.info(f"配置加载完成. 使用设备: {device}")
 
-    with open(config['id_maps_file'], 'rb') as f:
+    with open(config['data']['id_maps_file'], 'rb') as f:
         id_maps = pickle.load(f)
         item_num = id_maps['num_items']
 
     # 数据加载 - 完全使用HSTU的数据管道
-    train_dataset = RecDataset(config['train_file'], config['id_maps_file'], config['max_seq_len'], mode='train')
-    val_dataset = RecDataset(config['validation_file'], config['id_maps_file'], config['max_seq_len'], mode='validation')
-    test_dataset = RecDataset(config['test_file'], config['id_maps_file'], config['max_seq_len'], mode='test')
+    train_dataset = RecDataset(config['data']['train_file'], config['data']['id_maps_file'], config['encoder_model']['max_len'], mode='train')
+    val_dataset = RecDataset(config['data']['validation_file'], config['data']['id_maps_file'], config['encoder_model']['max_len'], mode='validation')
+    test_dataset = RecDataset(config['data']['test_file'], config['data']['id_maps_file'], config['encoder_model']['max_len'], mode='test')
 
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=config['num_workers'])
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=config['num_workers'])
-    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=config['num_workers'])
+    train_loader = DataLoader(train_dataset, batch_size=config['pretrain']['batch_size'], shuffle=True, num_workers=config['pretrain']['num_workers'])
+    val_loader = DataLoader(val_dataset, batch_size=config['pretrain']['batch_size'], shuffle=False, num_workers=config['pretrain']['num_workers'])
+    test_loader = DataLoader(test_dataset, batch_size=config['pretrain']['batch_size'], shuffle=False, num_workers=config['pretrain']['num_workers'])
     logging.info(f"数据集加载完成. 物品总数: {item_num}")
 
     # 模型实例化 - Baseline Transformer
     model = BaselineTransformer(
         item_num=item_num,
-        embedding_dim=config['embedding_dim'],
-        max_len=config['max_seq_len'],
-        num_layers=config['num_encoder_layers'],
-        num_heads=config['nhead'],
-        dropout=config['dropout'],
+        embedding_dim=config['encoder_model']['embedding_dim'],
+        max_len=config['encoder_model']['max_len'],
+        num_layers=config['encoder_model']['num_layers'],
+        num_heads=config['encoder_model']['num_heads'],
+        dropout=config['encoder_model']['dropout'],
         pad_token_id=config['pad_token_id']
     ).to(device)
 
     # 使用与HSTU相同的优化器设置
     optimizer = torch.optim.AdamW(
         model.parameters(), 
-        lr=config['learning_rate'], 
-        weight_decay=config['weight_decay'],
+        lr=config['pretrain']['learning_rate'], 
+        weight_decay=config['pretrain']['weight_decay'],
         betas=(0.9, 0.98)  # 与HSTU保持一致
     )
     
     # 使用与HSTU相同的Sampled Softmax损失
     criterion = SampledSoftmaxLoss(
-        num_negatives=config['num_neg_samples'], 
-        temperature=config['temperature']
+        num_negatives=config['pretrain']['num_neg_samples'], 
+        temperature=config['pretrain']['temperature']
     )
     
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=3, factor=0.5, verbose=True)
@@ -292,8 +294,8 @@ def train():
     patience_counter = 0
     logging.info("--- 开始Baseline训练 (对齐HSTU训练流程) ---")
 
-    for epoch in range(config['num_epochs']):
-        logging.info(f"--- Epoch {epoch+1}/{config['num_epochs']} ---")
+    for epoch in range(config['pretrain']['num_epochs']):
+        logging.info(f"--- Epoch {epoch+1}/{config['pretrain']['num_epochs']} ---")
         
         # 训练循环 - N-to-N方式，每个位置预测下一个（与HSTU完全一致）
         model.train()
@@ -346,25 +348,25 @@ def train():
                 user_embeddings = sequence_output[:, -1, :]  # [B, D] 取最后一个位置
                 
                 # 进行全量评估
-                hr, ndcg = get_metrics_full_eval(user_embeddings, all_item_embeddings, target_item_ids, k=config['top_k'])
+                hr, ndcg = get_metrics_full_eval(user_embeddings, all_item_embeddings, target_item_ids, k=config['evaluation']['top_k'])
                 total_hr += hr
                 total_ndcg += ndcg
 
         avg_hr = total_hr / len(val_loader)
         avg_ndcg = total_ndcg / len(val_loader)
-        logging.info(f"验证集（全量评估） ==> HR@{config['top_k']}: {avg_hr:.4f}, NDCG@{config['top_k']}: {avg_ndcg:.4f}")
+        logging.info(f"验证集（全量评估） ==> HR@{config['evaluation']['top_k']}: {avg_hr:.4f}, NDCG@{config['evaluation']['top_k']}: {avg_ndcg:.4f}")
         
         scheduler.step(avg_ndcg)
 
         if avg_ndcg > best_ndcg:
             best_ndcg = avg_ndcg
             patience_counter = 0
-            model_path = config['checkpoint_dir'] / 'baseline_transformer_best.pth'
+            model_path = config['data']['checkpoint_dir'] / 'baseline_transformer_best.pth'
             logging.info(f"发现新的最佳Baseline模型! NDCG: {best_ndcg:.4f}. 保存至 {model_path}")
             torch.save(model.state_dict(), model_path)
         else:
             patience_counter += 1
-            if patience_counter >= config['early_stopping_patience']:
+            if patience_counter >= config['pretrain']['early_stopping_patience']:
                 logging.info("触发 EarlyStopping. 停止训练.")
                 break
 
@@ -372,7 +374,7 @@ def train():
     
     # 测试部分
     logging.info("--- 使用最佳Baseline模型进行测试（全量评估） ---")
-    best_model_path = config['checkpoint_dir'] / 'baseline_transformer_best.pth'
+    best_model_path = config['data']['checkpoint_dir'] / 'baseline_transformer_best.pth'
     if os.path.exists(best_model_path):
         model.load_state_dict(torch.load(best_model_path))
         model.eval()
@@ -390,14 +392,14 @@ def train():
                 
                 sequence_output = model.forward(seq)  # [B, L, D]
                 user_embeddings = sequence_output[:, -1, :]  # [B, D] 取最后一个位置
-                hr, ndcg = get_metrics_full_eval(user_embeddings, all_item_embeddings, target_item_ids, k=config['top_k'])
+                hr, ndcg = get_metrics_full_eval(user_embeddings, all_item_embeddings, target_item_ids, k=config['evaluation']['top_k'])
                 total_hr += hr
                 total_ndcg += ndcg
 
         avg_hr = total_hr / len(test_loader)
         avg_ndcg = total_ndcg / len(test_loader)
-        logging.info(f"Baseline测试集结果（全量评估） ==> HR@{config['top_k']}: {avg_hr:.4f}, NDCG@{config['top_k']}: {avg_ndcg:.4f}")
-        logging.info(f"*** Baseline最终结果 ==> HR@{config['top_k']}: {avg_hr:.4f}, NDCG@{config['top_k']}: {avg_ndcg:.4f} ***")
+        logging.info(f"Baseline测试集结果（全量评估） ==> HR@{config['evaluation']['top_k']}: {avg_hr:.4f}, NDCG@{config['evaluation']['top_k']}: {avg_ndcg:.4f}")
+        logging.info(f"*** Baseline最终结果 ==> HR@{config['evaluation']['top_k']}: {avg_hr:.4f}, NDCG@{config['evaluation']['top_k']}: {avg_ndcg:.4f} ***")
     else:
         logging.warning("未找到最佳Baseline模型文件，跳过测试。")
 

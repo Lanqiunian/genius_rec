@@ -1,69 +1,55 @@
-# src/dataset.py (修正版)
-
-import torch
-import torch.utils.data as data
 import pandas as pd
 import numpy as np
-import pickle
-
-class RecDataset(data.Dataset):
-    def __init__(self, data_path, id_maps_path, max_seq_len, num_neg_samples=100, mode='train'):
+import torch
+from torch.utils.data import Dataset
+# --- 1. 数据集准备 (适配Seq2Seq任务) ---
+# 这个Dataset类用于将序列数据分割为编码器输入和解码器目标
+class Seq2SeqRecDataset(Dataset):
+    def __init__(self, data_path, max_seq_len, pad_token_id=0, split_ratio=0.5):
         self.data = pd.read_parquet(data_path)
         self.max_seq_len = max_seq_len
-        self.num_neg_samples = num_neg_samples
-        self.mode = mode
-
-        with open(id_maps_path, 'rb') as f:
-            id_maps = pickle.load(f)
-            
-            # 【关键修正】直接使用'num_items'键来获取物品总数
-            self.item_num = id_maps['num_items']
+        self.pad_token_id = pad_token_id
+        # 分割点，例如0.5表示一半历史用于编码，一半用于解码
+        self.split_point = int(max_seq_len * split_ratio)
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        item_seq = self.data.iloc[idx]['history']
+        # 获取完整的历史序列
+        full_seq = self.data.iloc[idx]['history']
+        
+        # 截断到最大长度
+        if len(full_seq) > self.max_seq_len:
+            full_seq = full_seq[-self.max_seq_len:]
+        
+        # 分割为源序列(编码器输入)和目标序列(解码器输入/目标)
+        source_seq = full_seq[:self.split_point]
+        target_seq = full_seq[self.split_point:]
 
-        if self.mode == 'train':
-            # 模式一：N-to-N 训练
-            input_ids = np.zeros(self.max_seq_len, dtype=np.int32)
-            target_ids = np.zeros(self.max_seq_len, dtype=np.int32)
-            
-            # 从序列末尾截取，保证数据最新
-            end_idx = len(item_seq)
-            start_idx = max(0, end_idx - self.max_seq_len)
-            
-            seq_slice = item_seq[start_idx:end_idx]
-            
-            # 填充到max_seq_len
-            input_ids[-len(seq_slice)+1:] = seq_slice[:-1]
-            target_ids[-len(seq_slice)+1:] = seq_slice[1:]
-            
-            return torch.LongTensor(input_ids), torch.LongTensor(target_ids)
+        # 如果目标序列为空，则跳过此样本 (或者使用整个序列作为源)
+        if len(target_seq) == 0:
+            source_seq = full_seq[:-1]
+            target_seq = full_seq[1:]
 
-        else:
-            # 模式二：Leave-One-Out 验证/测试
-            input_seq = item_seq[:-1]
-            
-            # 截断
-            if len(input_seq) > self.max_seq_len:
-                input_seq = input_seq[-self.max_seq_len:]
-            
-            input_ids = np.zeros(self.max_seq_len, dtype=np.int32)
-            input_ids[-len(input_seq):] = input_seq
-            
-            positive_item = item_seq[-1]
-            
-            negative_samples = []
-            while len(negative_samples) < self.num_neg_samples:
-                # 【修正】randint上界是开区间，所以要+1才能包含item_num
-                neg_candidate = np.random.randint(1, self.item_num + 1)
-                if neg_candidate != positive_item and neg_candidate not in item_seq:
-                    negative_samples.append(neg_candidate)
-            
-            return (
-                torch.LongTensor(input_ids),
-                torch.LongTensor([positive_item]),
-                torch.LongTensor(negative_samples)
-            )
+        # 创建带padding的输入张量
+        source_ids = np.full(self.split_point, self.pad_token_id, dtype=np.int64)
+        source_ids[-len(source_seq):] = source_seq
+
+        # 解码器的输入是目标序列的前n-1项, 并在开头加上<SOS> (这里用pad_token_id=0模拟)
+        decoder_input_len = self.max_seq_len - self.split_point
+        decoder_input_ids = np.full(decoder_input_len, self.pad_token_id, dtype=np.int64)
+        # 解码器的输入通常以一个特殊的“开始”符开头，我们这里用pad_id=0
+        # 并且只到target_seq的倒数第二个元素
+        decoder_input_ids[1:len(target_seq)] = target_seq[:-1]
+
+
+        # 解码器的目标是完整的序列
+        labels = np.full(decoder_input_len, self.pad_token_id, dtype=np.int64)
+        labels[:len(target_seq)] = target_seq
+        
+        return {
+            'source_ids': torch.tensor(source_ids, dtype=torch.long),
+            'decoder_input_ids': torch.tensor(decoder_input_ids, dtype=torch.long),
+            'labels': torch.tensor(labels, dtype=torch.long)
+        }

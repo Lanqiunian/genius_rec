@@ -1,14 +1,10 @@
-# src/model.py (完全对齐官方HSTU实现)
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-# 【新增】导入checkpoint功能
 from torch.utils.checkpoint import checkpoint
 
 class RelativePositionalBias(nn.Module):
-    """官方的相对位置偏置实现"""
     def __init__(self, max_seq_len: int, num_heads: int) -> None:
         super().__init__()
         self._max_seq_len = max_seq_len
@@ -49,7 +45,6 @@ class RelativePositionalBias(nn.Module):
         return bias
 
 class HstuBlock(nn.Module):
-    """完全对齐官方的HSTU Block实现"""
     def __init__(self, embedding_dim: int, linear_hidden_dim: int, attention_dim: int, 
                  num_heads: int, dropout_ratio: float = 0.1, normalization: str = "rel_bias"):
         super(HstuBlock, self).__init__()
@@ -140,7 +135,7 @@ class HstuBlock(nn.Module):
         # 门控机制：u * normalized_attention_output
         gated_output = u * norm_attn_output
         
-        # 输出投影
+        # 输出投影，最后的线性层
         output = self._o(F.dropout(gated_output.view(-1, self._linear_dim * self._num_heads), 
                                   p=self._dropout_ratio, training=self.training))
         output = output.view(batch_size, seq_len, self._embedding_dim)

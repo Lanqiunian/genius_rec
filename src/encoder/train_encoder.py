@@ -14,8 +14,8 @@ import numpy as np
 # 使用模块化导入
 from src.config import get_config
 # from src.improved_hstu import HSTU as Hstu 
-from src.model import Hstu  # 原版模型
-from src.dataset import RecDataset 
+from src.encoder.encoder import Hstu  # 原版模型
+from src.encoder.dataset4encoder import RecDataset 
 
 def set_seed(seed):
     """设置随机种子以确保结果可复现"""
@@ -122,57 +122,59 @@ class SampledSoftmaxLoss(nn.Module):
 def train():
     config = get_config()
     
-    config['checkpoint_dir'].mkdir(parents=True, exist_ok=True)
+    config['data']['checkpoint_dir'].mkdir(parents=True, exist_ok=True)
+    config['data']['log_dir'].mkdir(parents=True, exist_ok=True)
     
+    log_file = config['data']['log_dir'] / config['pretrain']['log_file']
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s - %(levelname)s - %(message)s',
-                        handlers=[logging.FileHandler(config['log_file']), logging.StreamHandler()])
+                        handlers=[logging.FileHandler(log_file), logging.StreamHandler()])
     
     set_seed(config['seed'])
     device = torch.device(config['device'])
     logging.info(f"配置加载完成. 使用设备: {device}")
 
-    with open(config['id_maps_file'], 'rb') as f:
+    with open(config['data']['id_maps_file'], 'rb') as f:
         id_maps = pickle.load(f)
         item_num = id_maps['num_items']
 
-    train_dataset = RecDataset(config['train_file'], config['id_maps_file'], config['max_seq_len'], mode='train')
-    val_dataset = RecDataset(config['validation_file'], config['id_maps_file'], config['max_seq_len'], mode='validation')
-    test_dataset = RecDataset(config['test_file'], config['id_maps_file'], config['max_seq_len'], mode='test')
+    train_dataset = RecDataset(config['data']['train_file'], config['data']['id_maps_file'], config['encoder_model']['max_len'], mode='train')
+    val_dataset = RecDataset(config['data']['validation_file'], config['data']['id_maps_file'], config['encoder_model']['max_len'], mode='validation')
+    test_dataset = RecDataset(config['data']['test_file'], config['data']['id_maps_file'], config['encoder_model']['max_len'], mode='test')
 
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=config['num_workers'])
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=config['num_workers'])
-    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=config['num_workers'])
+    train_loader = DataLoader(train_dataset, batch_size=config['pretrain']['batch_size'], shuffle=True, num_workers=config['pretrain']['num_workers'])
+    val_loader = DataLoader(val_dataset, batch_size=config['pretrain']['batch_size'], shuffle=False, num_workers=config['pretrain']['num_workers'])
+    test_loader = DataLoader(test_dataset, batch_size=config['pretrain']['batch_size'], shuffle=False, num_workers=config['pretrain']['num_workers'])
     logging.info(f"数据集加载完成. 物品总数: {item_num}")
 
     model = Hstu(
         item_num=item_num,
-        embedding_dim=config['embedding_dim'],
-        linear_hidden_dim=config['linear_hidden_dim'],
-        attention_dim=config['attention_dim'],
-        num_heads=config['nhead'],
-        num_layers=config['num_encoder_layers'],
-        max_len=config['max_seq_len'],
-        dropout=config['dropout'],
+        embedding_dim=config['encoder_model']['embedding_dim'],
+        linear_hidden_dim=config['encoder_model']['linear_hidden_dim'],
+        attention_dim=config['encoder_model']['attention_dim'],
+        num_heads=config['encoder_model']['num_heads'],
+        num_layers=config['encoder_model']['num_layers'],
+        max_len=config['encoder_model']['max_len'],
+        dropout=config['encoder_model']['dropout'],
         pad_token_id=config['pad_token_id']
     ).to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(), 
-        lr=config['learning_rate'], 
-        weight_decay=config['weight_decay'],
+        lr=config['pretrain']['learning_rate'], 
+        weight_decay=config['pretrain']['weight_decay'],
         betas=(0.9, 0.98)
     )
     
     criterion = SampledSoftmaxLoss(
-        num_negatives=config['num_neg_samples'], 
-        temperature=config['temperature']
+        num_negatives=config['pretrain']['num_neg_samples'], 
+        temperature=config['pretrain']['temperature']
     )
     
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=3, factor=0.5, verbose=True)
 
     # 【新增】断点续传的初始化逻辑
-    model_path = config['checkpoint_dir'] / 'hstu_official_aligned_best.pth'
+    model_path = config['data']['checkpoint_dir'] / 'hstu_official_aligned_best.pth'
     start_epoch = 0
     best_ndcg = 0.0
     patience_counter = 0
@@ -203,8 +205,8 @@ def train():
     logging.info("--- 开始官方风格的训练 (支持断点续传) ---")
 
     # 【修改】训练循环的起始点
-    for epoch in range(start_epoch, config['num_epochs']):
-        logging.info(f"--- Epoch {epoch}/{config['num_epochs']-1} ---")
+    for epoch in range(start_epoch, config['pretrain']['num_epochs']):
+        logging.info(f"--- Epoch {epoch}/{config['pretrain']['num_epochs']-1} ---")
         
         model.train()
         total_loss = 0.0
@@ -246,13 +248,13 @@ def train():
                 sequence_output = model.forward(seq)
                 user_embeddings = sequence_output[:, -1, :]
                 
-                hr, ndcg = get_metrics_full_eval(user_embeddings, all_item_embeddings, target_item_ids, k=config['top_k'])
+                hr, ndcg = get_metrics_full_eval(user_embeddings, all_item_embeddings, target_item_ids, k=config['evaluation']['top_k'])
                 total_hr += hr
                 total_ndcg += ndcg
 
         avg_hr = total_hr / len(val_loader)
         avg_ndcg = total_ndcg / len(val_loader)
-        logging.info(f"验证集（全量评估） ==> HR@{config['top_k']}: {avg_hr:.4f}, NDCG@{config['top_k']}: {avg_ndcg:.4f}")
+        logging.info(f"验证集（全量评估） ==> HR@{config['evaluation']['top_k']}: {avg_hr:.4f}, NDCG@{config['evaluation']['top_k']}: {avg_ndcg:.4f}")
         
         scheduler.step(avg_ndcg)
 
@@ -271,7 +273,7 @@ def train():
             }, model_path)
         else:
             patience_counter += 1
-            if patience_counter >= config['early_stopping_patience']:
+            if patience_counter >= config['pretrain']['early_stopping_patience']:
                 logging.info(f"触发 EarlyStopping (patience={patience_counter}). 停止训练.")
                 break
 
@@ -296,13 +298,13 @@ def train():
                 
                 sequence_output = model.forward(seq)
                 user_embeddings = sequence_output[:, -1, :]
-                hr, ndcg = get_metrics_full_eval(user_embeddings, all_item_embeddings, target_item_ids, k=config['top_k'])
+                hr, ndcg = get_metrics_full_eval(user_embeddings, all_item_embeddings, target_item_ids, k=config['evaluation']['top_k'])
                 total_hr += hr
                 total_ndcg += ndcg
 
         avg_hr = total_hr / len(test_loader)
         avg_ndcg = total_ndcg / len(test_loader)
-        logging.info(f"测试集结果 ==> HR@{config['top_k']}: {avg_hr:.4f}, NDCG@{config['top_k']}: {avg_ndcg:.4f}")
+        logging.info(f"测试集结果 ==> HR@{config['evaluation']['top_k']}: {avg_hr:.4f}, NDCG@{config['evaluation']['top_k']}: {avg_ndcg:.4f}")
     else:
         logging.warning("未找到最佳模型文件，跳过测试。")
 

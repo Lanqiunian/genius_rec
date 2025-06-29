@@ -1,4 +1,4 @@
-# preprocess_aligned.py (对齐官方代码版本)
+# preprocess.py (重构版)
 
 import pandas as pd
 import gzip
@@ -6,24 +6,7 @@ from tqdm import tqdm
 import pickle
 import json
 from pathlib import Path
-
-# --- 配置 (对齐官方代码) ---
-ROOT_DIR = Path.cwd()
-DATA_DIR = ROOT_DIR / "data"
-# 为对齐版本创建新的输出目录
-PROCESSED_DATA_DIR = DATA_DIR / "processed_aligned"
-# 注意：官方代码使用ratings_Books.csv，我们用jsonl文件模拟，只取需要的列
-REVIEW_FILE = DATA_DIR / "Books.jsonl.gz" 
-# 输出文件
-TRAIN_FILE = PROCESSED_DATA_DIR / "train.parquet"
-VALIDATION_FILE = PROCESSED_DATA_DIR / "validation.parquet"
-TEST_FILE = PROCESSED_DATA_DIR / "test.parquet"
-ID_MAPS_FILE = PROCESSED_DATA_DIR / "id_maps.pkl"
-
-# 对齐参数
-K_CORE = 5
-MIN_SEQ_LEN = 5
-SEED = 42
+from src.config import get_config
 
 def parse_jsonl_to_df(file_path):
     """解析JSONL并直接返回只含所需列的DataFrame，以节省内存"""
@@ -44,6 +27,26 @@ def parse_jsonl_to_df(file_path):
 
 def main():
     """完全对齐官方代码库中AmazonDataProcessor的预处理逻辑"""
+    config = get_config()
+    
+    # 使用配置中的路径
+    DATA_DIR = config['data']['data_dir']
+    PROCESSED_DATA_DIR = config['data']['processed_data_dir']
+    
+    # 输入文件
+    REVIEW_FILE = DATA_DIR / "Books.jsonl.gz" 
+    
+    # 输出文件
+    TRAIN_FILE = config['data']['train_file']
+    VALIDATION_FILE = config['data']['validation_file']
+    TEST_FILE = config['data']['test_file']
+    ID_MAPS_FILE = config['data']['id_maps_file']
+    
+    # 配置参数
+    K_CORE = config['k_core']
+    MIN_SEQ_LEN = config['min_seq_len']
+    SEED = config['seed']
+    
     PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
     
     print("--- 1. 加载原始评论数据 ---")

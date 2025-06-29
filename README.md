@@ -16,8 +16,8 @@
 
 为实现此目标，GENIUS-Rec采用了一个标准的**Encoder-Decoder（编码器-解码器）**架构：
 
-* **编码器 (Encoder)**: 为了追求极致的序列理解能力，我们完整复现并预训练了Meta AI提出的SOTA模型 **HSTU (Hierarchical Sequential Transduction Unit)**，使其能深度编码用户的行为历史。
-* **解码器 (Decoder)**: 在编码器提供的用户理解之上，我们构建了一个标准的**生成式Transformer解码器**，负责自回归地生成推荐序列。
+* **编码器 (Encoder)**: 为了追求极致的序列理解能力，完整复现并预训练了Meta AI提出的SOTA模型 **HSTU (Hierarchical Sequential Transduction Unit)**，使其能深度编码用户的行为历史。
+* **解码器 (Decoder)**: 在编码器提供的用户理解之上，构建了一个标准的**生成式Transformer解码器**，负责自回归地生成推荐序列。
 
 ## 项目进展与核心成果
 
@@ -45,7 +45,7 @@
 git clone [https://github.com/Lanqiunian/genius_rec.git](https://github.com/Lanqiunian/genius_rec.git)
 cd genius_rec
 
-# (推荐) 创建并激活虚拟环境
+# 创建并激活虚拟环境
 python -m venv .venv
 source .venv/bin/activate  # on Windows, use `.venv\Scripts\activate`
 

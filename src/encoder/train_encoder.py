@@ -11,7 +11,7 @@ import numpy as np
 
 
 from src.config import get_config
-from src.encoder.encoder import Hstu
+from src.encoder.encoder import Hstu  
 from src.encoder.dataset4encoder import RecDataset 
 
 def set_seed(seed):

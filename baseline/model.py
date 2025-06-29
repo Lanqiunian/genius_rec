@@ -1,113 +1,81 @@
-# baseline/model_corrected.py
+# src/model.py
 
 import torch
 import torch.nn as nn
 import math
 
-class SinusoidalPositionalEncoder(nn.Module):
-    """
-    更标准的正弦/余弦位置编码器.
-    """
+# 辅助模块: 位置编码器 (这部分无需修改)
+class PositionalEncoder(nn.Module):
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
 
         position = torch.arange(max_len).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, d_model)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0) # -> [1, max_len, d_model]
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, L, D]
-        """
-        # x的尺寸是 [B, L, D], pe的尺寸是 [1, max_len, D]
-        # 直接截取所需长度并相加
-        x = x + self.pe[:, :x.size(1), :]
-        return self.dropout(x)
+        x = x.permute(1, 0, 2) 
+        x = x + self.pe[:x.size(0)]
+        x = self.dropout(x)
+        return x.permute(1, 0, 2)
 
-class BaselineTransformer(nn.Module):
-    """
-    经过关键修正的Transformer baseline模型
-    1. 使用Pre-LN (norm_first=True)
-    2. 使用Sinusoidal (正弦) 位置编码
-    3. 使用GELU激活函数
-    """
-    def __init__(self, item_num, embedding_dim, max_len, num_layers, num_heads, dropout, pad_token_id):
+# --- 核心修正点：简化HSTU_Encoder，移除sep_token_id ---
+class HSTU_Encoder(nn.Module):
+    def __init__(self, num_items: int, config: dict):
         super().__init__()
-        self.item_num = item_num
-        self.embedding_dim = embedding_dim
-        self.max_len = max_len
-        self.pad_token_id = pad_token_id
+        self.config = config
+        self.embedding_dim = config['embedding_dim']
         
-        # 物品嵌入层
-        self.item_embedding = nn.Embedding(item_num + 1, embedding_dim, padding_idx=pad_token_id)
-        
-        # --- 修正 #2: 使用正弦位置编码 ---
-        self.positional_encoder = SinusoidalPositionalEncoder(embedding_dim, dropout, max_len)
-        
-        # Transformer编码器层
+        self.item_embedding = nn.Embedding(num_items, self.embedding_dim, padding_idx=0)
+        self.positional_encoder = PositionalEncoder(self.embedding_dim, config['dropout'], config['max_seq_len'])
+
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embedding_dim,
-            nhead=num_heads,
-            dim_feedforward=embedding_dim * 4, # 保持与常见实现一致
-            dropout=dropout,
-            activation='gelu',  # --- 修正 #3: 使用GELU, 效果通常优于ReLU ---
+            d_model=self.embedding_dim,
+            nhead=config['nhead'],
+            dim_feedforward=config['dim_feedforward'],
+            dropout=config['dropout'],
+            activation='relu',
             batch_first=True,
-            norm_first=True  # --- 修正 #1: 切换到Pre-LN, 关键修正！ ---
+            norm_first=True
         )
         self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer, 
-            num_layers=num_layers,
-            norm=nn.LayerNorm(embedding_dim) # 最终输出前再加一个LN
+            encoder_layer,
+            num_layers=config['num_encoder_layers']
         )
-        
-        # 初始化权重
         self.init_weights()
-    
+
     def init_weights(self):
-        """初始化模型权重，与HSTU实践对齐"""
-        initrange = 0.02 # 与HSTU对齐
-        self.item_embedding.weight.data.normal_(mean=0.0, std=initrange)
+        initrange = 0.1
+        self.item_embedding.weight.data.uniform_(-initrange, initrange)
 
-    def _generate_causal_mask(self, sz, device):
-        """生成一个上三角矩阵的mask，用于阻止看到未来的token"""
-        mask = torch.triu(torch.ones(sz, sz, device=device), diagonal=1)
-        mask = mask.masked_fill(mask==1, float('-inf'))
-        return mask
+    def forward(self, seq: torch.Tensor) -> torch.Tensor:
+        key_padding_mask = (seq == 0)
+        item_embed = self.item_embedding(seq) * math.sqrt(self.embedding_dim)
+        pos_embed = self.positional_encoder(item_embed)
+        output = self.transformer_encoder(pos_embed, src_key_padding_mask=key_padding_mask)
+        return output
 
-    def forward(self, input_ids):
-        """
-        前向传播
-        Args:
-            input_ids: [B, L] 输入序列
-        Returns:
-            sequence_output: [B, L, D] 序列输出
-        """
-        batch_size, seq_len = input_ids.size()
-        device = input_ids.device
+# --- 核心修正点：简化Standalone_HSTU_Model的初始化 ---
+class Standalone_HSTU_Model(nn.Module):
+    def __init__(self, num_items: int, config: dict):
+        super().__init__()
+        # 现在这里的调用是匹配的
+        self.hstu_encoder = HSTU_Encoder(num_items, config)
 
-        # 创建 padding mask (padding位置为True, 非padding为False)
-        padding_mask = (input_ids == self.pad_token_id)
-
-        # 创建 causal mask
-        causal_mask = self._generate_causal_mask(seq_len, device)
+    def forward(self, seq: torch.Tensor) -> torch.Tensor:
+        sequence_output = self.hstu_encoder(seq)
         
-        # 物品嵌入
-        item_emb = self.item_embedding(input_ids) # [B, L, D]
+        # 为了预测，我们只取序列中最后一个有效（非padding）物品的表征
+        # 一个简单但有效的近似是直接取最后一个时间步的输出
+        # 注意: DataLoader送出的batch中，每个序列的有效长度可能不同
+        # 在更精细的实现中，需要根据每个序列的真实长度来提取对应的表征
+        last_item_representation = sequence_output[:, -1, :]
         
-        # 应用位置编码
-        pos_emb = self.positional_encoder(item_emb)
+        item_embeddings = self.hstu_encoder.item_embedding.weight
+        scores = torch.matmul(last_item_representation, item_embeddings.T)
         
-        # 通过Transformer编码器
-        sequence_output = self.transformer_encoder(
-            pos_emb, 
-            mask=causal_mask, 
-            src_key_padding_mask=padding_mask
-        )
-        
-        return sequence_output
+        return scores

@@ -19,7 +19,7 @@ class RecDataset(data.Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-       
+        # 【BUG FIX】Ensure item_seq is a Python list, not a NumPy array.
         item_seq = self.data.iloc[idx]['history'].tolist()
 
         if self.mode == 'train':

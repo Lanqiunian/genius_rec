@@ -1,3 +1,5 @@
+# src/config.py (重构版)
+
 import torch
 from pathlib import Path
 
@@ -63,8 +65,8 @@ def get_config():
             "log_file": "pretrain_encoder.log",
             "num_epochs": 501,         
             "batch_size": 256,         
-            "learning_rate": 1e-3,
-            "weight_decay": 0,
+            "learning_rate": 1e-4,
+            "weight_decay": 0.1,
             "early_stopping_patience": 20,
             "num_workers": 10,
             "num_neg_samples": 512, # 负采样数量
@@ -74,12 +76,13 @@ def get_config():
         # --- 阶段二: Encoder-Decoder 微调配置 ---
         "finetune": {
             "log_file": "finetune_genius_rec.log",
-            "num_epochs": 20, # 微调通常不需要太多轮次
+            "num_epochs": 50, # 微调通常不需要太多轮次
             "batch_size": 64, # 由于模型更大，可能需要减小batch_size
             "learning_rate": {
-                "decoder_lr": 5e-5,
+                "decoder_lr": 1e-3, # 解码器使用较大的学习率
                 "encoder_lr": 5e-6, # 编码器使用更小的学习率
             },
+            "warmup_steps": 1000, # 学习率预热步数
             "weight_decay": 0.01,
             "early_stopping_patience": 5,
             "num_workers": 10,

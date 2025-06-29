@@ -76,7 +76,7 @@ class GenerativeDecoder(nn.Module):
     它由物品嵌入层、位置编码、多个解码器模块和一个最终的线性输出层组成.
     """
     def __init__(self, num_items: int, embedding_dim: int, num_layers: int, num_heads: int, 
-                 ffn_hidden_dim: int, max_seq_len: int, dropout_ratio: float = 0.1):
+             ffn_hidden_dim: int, max_seq_len: int, dropout_ratio: float = 0.1, pad_token_id: int = 0):
         super(GenerativeDecoder, self).__init__()
         
         self.item_embedding = nn.Embedding(num_items, embedding_dim, padding_idx=0)
@@ -88,7 +88,7 @@ class GenerativeDecoder(nn.Module):
         
         # 最终的线性层，将输出映射到词汇表大小，用于预测下一个物品
         self.output_layer = nn.Linear(embedding_dim, num_items)
-        
+        self.pad_token_id = pad_token_id
         self.dropout = nn.Dropout(dropout_ratio)
         self.embedding_dim = embedding_dim
 

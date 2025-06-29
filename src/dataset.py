@@ -41,12 +41,15 @@ class Seq2SeqRecDataset(Dataset):
         decoder_input_ids = np.full(decoder_input_len, self.pad_token_id, dtype=np.int64)
         # 解码器的输入通常以一个特殊的“开始”符开头，我们这里用pad_id=0
         # 并且只到target_seq的倒数第二个元素
-        decoder_input_ids[1:len(target_seq)] = target_seq[:-1]
+        if len(target_seq) > 1:
+            copy_len = min(len(target_seq) - 1, decoder_input_len - 1)
+            decoder_input_ids[1:1+copy_len] = target_seq[:copy_len]
 
 
         # 解码器的目标是完整的序列
         labels = np.full(decoder_input_len, self.pad_token_id, dtype=np.int64)
-        labels[:len(target_seq)] = target_seq
+        copy_len = min(len(target_seq), decoder_input_len)
+        labels[:copy_len] = target_seq[:copy_len]
         
         return {
             'source_ids': torch.tensor(source_ids, dtype=torch.long),

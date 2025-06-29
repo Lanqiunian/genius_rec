@@ -21,8 +21,6 @@ from torch.utils.data import DataLoader, Dataset
 from src.config import get_config
 from src.GeniusRec import GENIUSRecModel
 from src.dataset import Seq2SeqRecDataset
-
-# +++ 导入 platform 模块，用于判断操作系统 +++
 import platform
 
 

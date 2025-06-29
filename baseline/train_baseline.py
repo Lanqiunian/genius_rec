@@ -14,6 +14,7 @@ import numpy as np
 # 使用主项目的配置和数据集
 from src.config import get_config
 from src.encoder.dataset4encoder import RecDataset 
+from baseline.model import BaselineTransformer 
 
 def set_seed(seed):
     """设置随机种子以确保结果可复现"""
@@ -144,95 +145,7 @@ class SampledSoftmaxLoss(nn.Module):
         
         return weighted_loss
 
-class BaselineTransformer(nn.Module):
-    """
-    简单的Transformer baseline模型，用作与HSTU对比的基准
-    """
-    def __init__(self, item_num, embedding_dim, max_len, num_layers, num_heads, dropout, pad_token_id):
-        super().__init__()
-        self.item_num = item_num
-        self.embedding_dim = embedding_dim
-        self.max_len = max_len
-        self.pad_token_id = pad_token_id
-        
-        # 物品嵌入层
-        self.item_embedding = nn.Embedding(item_num + 1, embedding_dim, padding_idx=pad_token_id)
-        
-        # 位置嵌入
-        self.position_embedding = nn.Embedding(max_len, embedding_dim)
-        
-        # Transformer编码器
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embedding_dim,
-            nhead=num_heads,
-            dim_feedforward=embedding_dim * 4,
-            dropout=dropout,
-            activation='relu',
-            batch_first=True,
-            norm_first=False
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        # Dropout和LayerNorm
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(embedding_dim)
-        
-        # 初始化权重
-        self.init_weights()
-    
-    def init_weights(self):
-        """初始化模型权重"""
-        for module in self.modules():
-            if isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, mean=0, std=0.02)
-            elif isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0, std=0.02)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-    
-    def _generate_square_subsequent_mask(self, sz, device):
-        """生成一个上三角矩阵的mask，用于阻止看到未来的token"""
-        mask = (torch.triu(torch.ones(sz, sz, device=device)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-        return mask
 
-    def forward(self, input_ids):
-        """
-        前向传播
-        Args:
-            input_ids: [B, L] 输入序列
-        Returns:
-            sequence_output: [B, L, D] 序列输出
-        """
-        batch_size, seq_len = input_ids.size()
-        device = input_ids.device # 获取设备
-
-        # 物品嵌入
-        item_emb = self.item_embedding(input_ids)  # [B, L, D]
-        
-        # 位置嵌入
-        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, seq_len)
-        position_emb = self.position_embedding(position_ids)  # [B, L, D]
-        
-        # 输入嵌入 = 物品嵌入 + 位置嵌入
-        embeddings = item_emb + position_emb
-        embeddings = self.dropout(embeddings)
-        embeddings = self.layer_norm(embeddings)
-        
-        # 创建 padding mask (padding位置为True)
-        padding_mask = (input_ids == self.pad_token_id)  # [B, L]
-
-        # 【新增】创建 causal mask
-        causal_mask = self._generate_square_subsequent_mask(seq_len, device) # [L, L]
-        
-        # 【修改】将 causal_mask 传入 Transformer 编码器
-        sequence_output = self.transformer_encoder(
-            embeddings, 
-            mask=causal_mask, 
-            src_key_padding_mask=padding_mask
-        )
-        
-        return sequence_output
 
 def train():
     config = get_config()

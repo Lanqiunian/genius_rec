@@ -77,7 +77,7 @@ def get_config():
         "finetune": {
             "log_file": "finetune_genius_rec.log",
             "num_epochs": 20, # 微调通常不需要太多轮次
-            "batch_size": 128, # 由于模型更大，可能需要减小batch_size
+            "batch_size": 64, # 由于模型更大，可能需要减小batch_size
             "learning_rate": {
                 "decoder_lr": 5e-5,
                 "encoder_lr": 5e-6, # 编码器使用更小的学习率

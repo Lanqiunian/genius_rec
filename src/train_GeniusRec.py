@@ -1,4 +1,3 @@
-# train_GeniusRec.py
 import argparse
 import logging
 import os
@@ -6,18 +5,25 @@ import pickle
 import random
 import math
 from tqdm import tqdm
-
+import pathlib
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
+# 训练参数
+# 冻结编码器参数，防止其在微调过程中被更新
+# python -m src.train_GeniusRec --encoder_weights_path checkpoints/hstu_encoder.pth --freeze_encoder
+# 不使用冻结编码器参数
+# python -m src.train_GeniusRec --encoder_weights_path checkpoints/hstu_encoder.pth
 
 from src.config import get_config
 from src.GeniusRec import GENIUSRecModel
 from src.dataset import Seq2SeqRecDataset
 
+# +++ 导入 platform 模块，用于判断操作系统 +++
+import platform
 
 
 # --- 1. 训练和评估函数 ---
@@ -32,7 +38,6 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch, num_
         labels = batch['labels'].to(device)
         source_padding_mask = (source_ids == 0).to(device)
         optimizer.zero_grad()
-        
         
         # 模型前向传播
         logits = model(source_ids, decoder_input_ids, source_padding_mask)
@@ -93,8 +98,14 @@ def main():
         torch.cuda.manual_seed_all(config['seed'])
 
     os.makedirs(args.save_dir, exist_ok=True)
-    config['data']['log_dir'].mkdir(parents=True, exist_ok=True)
-    log_file = config['data']['log_dir'] / config['finetune']['log_file']
+    # 确保 config['data']['log_dir'] 是 pathlib.Path 对象
+    log_dir_path = config['data']['log_dir']
+    if not isinstance(log_dir_path, pathlib.Path):
+        from pathlib import Path
+        log_dir_path = Path(log_dir_path)
+
+    log_dir_path.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir_path / config['finetune']['log_file']
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s - %(levelname)s - %(message)s',
                         handlers=[logging.FileHandler(log_file), logging.StreamHandler()])
@@ -142,8 +153,24 @@ def main():
 
     # --- 加载预训练权重 ---
     logging.info(f"Loading pre-trained encoder weights from: {args.encoder_weights_path}")
-    # 加载状态字典
+    
+  
+    # 如果当前系统是Linux，并且要加载的文件存在
+    if platform.system() == "Linux" and os.path.exists(args.encoder_weights_path):
+        # 暂时将 WindowsPath 指向 PosixPath，欺骗 unpickler
+        temp_windows_path = pathlib.WindowsPath
+        pathlib.WindowsPath = pathlib.PosixPath
+    # +++ 结束修改 +++
+
+    # 加载状态字典 (这行代码本身不变)
     encoder_state_dict = torch.load(args.encoder_weights_path, map_location=device)
+    
+    # +++ 开始修改: 恢复pathlib设置 +++
+    # 加载完成后，恢复原始的 pathlib.WindowsPath，避免影响后续操作
+    if platform.system() == "Linux":
+        pathlib.WindowsPath = temp_windows_path
+    # +++ 结束修改 +++
+    
     # 为了安全，只加载键匹配的权重
     model.encoder.load_state_dict(encoder_state_dict, strict=False) 
     logging.info("Encoder weights loaded successfully.")
@@ -164,11 +191,51 @@ def main():
     criterion = nn.CrossEntropyLoss(ignore_index=config['pad_token_id'])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5, verbose=True)
 
-    # --- 训练循环 ---
+    # --- 断点续传逻辑 ---
+    start_epoch = 0
     best_perplexity = float('inf')
     patience_counter = 0
     
-    for epoch in range(config['finetune']['num_epochs']):
+    # 检查点文件路径
+    latest_ckpt_path = os.path.join(args.save_dir, 'genius_rec_latest.pth')
+    best_ckpt_path = os.path.join(args.save_dir, 'genius_rec_best.pth')
+    
+    # 尝试加载最新检查点进行断点续传
+    if os.path.exists(latest_ckpt_path):
+        logging.info(f"发现最新检查点: {latest_ckpt_path}，正在加载...")
+        try:
+            checkpoint = torch.load(latest_ckpt_path, map_location=device)
+            
+            # 加载模型状态
+            model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # 加载优化器状态
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # 加载调度器状态
+            if 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            
+            # 恢复训练状态
+            start_epoch = checkpoint['epoch'] + 1
+            best_perplexity = checkpoint.get('best_perplexity', float('inf'))
+            patience_counter = checkpoint.get('patience_counter', 0)
+            
+            logging.info(f"成功加载检查点! 从 Epoch {start_epoch} 继续训练")
+            logging.info(f"当前最佳困惑度: {best_perplexity:.4f}")
+            logging.info(f"当前耐心计数: {patience_counter}")
+            
+        except Exception as e:
+            logging.warning(f"加载检查点失败: {e}")
+            logging.info("将从头开始训练")
+            start_epoch = 0
+            best_perplexity = float('inf')
+            patience_counter = 0
+    else:
+        logging.info("未发现检查点，从头开始训练")
+
+    # --- 训练循环 ---
+    for epoch in range(start_epoch, config['finetune']['num_epochs']):
         avg_train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, config['finetune']['num_epochs'])
         avg_val_loss, perplexity = evaluate(model, val_loader, criterion, device, epoch, config['finetune']['num_epochs'])
         
@@ -176,20 +243,82 @@ def main():
         
         scheduler.step(avg_val_loss)
         
+        # 保存最新检查点（每个epoch都保存）
+        latest_checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'best_perplexity': best_perplexity,
+            'current_perplexity': perplexity,
+            'patience_counter': patience_counter,
+            'train_loss': avg_train_loss,
+            'val_loss': avg_val_loss,
+            'config': config,
+            'args': vars(args)
+        }
+        torch.save(latest_checkpoint, latest_ckpt_path)
+        logging.info(f"最新检查点已保存: {latest_ckpt_path}")
+        
+        # 保存最佳检查点（仅在性能提升时保存）
         if perplexity < best_perplexity:
             best_perplexity = perplexity
             patience_counter = 0
-            save_path = os.path.join(args.save_dir, 'genius_rec_best.pth')
-            torch.save(model.state_dict(), save_path)
-            logging.info(f"New best model found! Perplexity: {best_perplexity:.4f}. Saved to {save_path}")
+            
+            best_checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_perplexity': best_perplexity,
+                'current_perplexity': perplexity,
+                'patience_counter': patience_counter,
+                'train_loss': avg_train_loss,
+                'val_loss': avg_val_loss,
+                'config': config,
+                'args': vars(args)
+            }
+            torch.save(best_checkpoint, best_ckpt_path)
+            logging.info(f"🎉 发现新的最佳模型! 困惑度: {best_perplexity:.4f}")
+            logging.info(f"最佳检查点已保存: {best_ckpt_path}")
         else:
             patience_counter += 1
+            logging.info(f"性能未提升，耐心计数: {patience_counter}/{config['finetune']['early_stopping_patience']}")
             if patience_counter >= config['finetune']['early_stopping_patience']:
-                logging.info(f"Early stopping triggered after {patience_counter} epochs without improvement.")
+                logging.info(f"触发早停! 连续 {patience_counter} 个epoch性能未提升")
                 break
                 
     logging.info("--- Fine-tuning finished ---")
-    logging.info(f"Best validation perplexity: {best_perplexity:.4f}")
+    # 如果循环因为早停而中断，epoch可能没有达到最大值，所以用 epoch+1
+    completed_epochs = epoch + 1 if 'epoch' in locals() else start_epoch
+    logging.info(f"训练总轮次: {completed_epochs}/{config['finetune']['num_epochs']}")
+    logging.info(f"最佳验证困惑度: {best_perplexity:.4f}")
+    
+    # 显示检查点信息
+    if os.path.exists(best_ckpt_path):
+        logging.info(f"✅ 最佳模型检查点: {best_ckpt_path}")
+    if os.path.exists(latest_ckpt_path):
+        logging.info(f"✅ 最新模型检查点: {latest_ckpt_path}")
+
+def load_checkpoint_info(checkpoint_path):
+    """加载并显示检查点信息的辅助函数"""
+    if not os.path.exists(checkpoint_path):
+        return None
+    
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        info = {
+            'epoch': checkpoint.get('epoch', -1),
+            'best_perplexity': checkpoint.get('best_perplexity', float('inf')),
+            'current_perplexity': checkpoint.get('current_perplexity', float('inf')),
+            'train_loss': checkpoint.get('train_loss', 0.0),
+            'val_loss': checkpoint.get('val_loss', 0.0),
+            'patience_counter': checkpoint.get('patience_counter', 0)
+        }
+        return info
+    except Exception as e:
+        print(f"加载检查点信息失败: {e}")
+        return None
 
 if __name__ == '__main__':
     main()

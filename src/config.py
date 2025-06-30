@@ -65,8 +65,8 @@ def get_config():
             "log_file": "pretrain_encoder.log",
             "num_epochs": 501,         
             "batch_size": 256,         
-            "learning_rate": 1e-4,
-            "weight_decay": 0.1,
+            "learning_rate": 1e-3,
+            "weight_decay": 0.3,
             "early_stopping_patience": 20,
             "num_workers": 10,
             "num_neg_samples": 512, # 负采样数量

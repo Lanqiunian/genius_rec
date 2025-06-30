@@ -22,6 +22,8 @@ from src.GeniusRec import GENIUSRecModel
 # 模型主动生成pad_token_id
 # 理想中的模型“自然”停止方式，但在当前训练设置下基本不起作用。
 
+# 使用以下命令运行脚本来可视化模型预测结果：
+# python visualize_predictions.py --checkpoint_path checkpoints/0629/genius_rec_best_0629.pth
 def generate_sequence(model, source_ids, max_len, pad_token_id, device):
     """
     【已优化】使用贪心策略自回归地生成序列。
@@ -79,6 +81,8 @@ def main():
     pad_token_id = config['pad_token_id']
     
     split_point = int(config['decoder_model']['max_seq_len'] * config['finetune']['split_ratio'])
+    
+    # 解码器的最大长度
     decoder_len = config['decoder_model']['max_seq_len'] - split_point
 
     # --- 2. 加载验证数据集 ---

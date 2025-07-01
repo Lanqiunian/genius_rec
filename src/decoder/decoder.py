@@ -125,47 +125,30 @@ class GenerativeDecoder(nn.Module):
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-    def forward(self, target_ids: torch.Tensor, encoder_output: torch.Tensor, memory_padding_mask: torch.Tensor):
+    def forward(self, target_ids: torch.Tensor, encoder_output: torch.Tensor, memory_padding_mask: torch.Tensor, return_weights: bool = False):
         batch_size, target_len = target_ids.size()
-        
-        # --- 1. 准备解码器输入 (逻辑不变) ---
         positions = torch.arange(0, target_len, device=target_ids.device).unsqueeze(0)
         target_emb = self.item_embedding(target_ids) * math.sqrt(self.embedding_dim)
         pos_emb = self.pos_embedding(positions)
         decoder_input = self.dropout(target_emb + pos_emb)
         target_mask = self._generate_square_subsequent_mask(target_len).to(target_ids.device)
         
-        # --- 2. 通过解码器Transformer层 (逻辑不变) ---
-        # hidden_state 是解码器在每个时间步的最终输出表征
         hidden_state = decoder_input
         for layer in self.decoder_layers:
             hidden_state = layer(hidden_state, encoder_output, target_mask, memory_padding_mask)
         
-        # --- 3. MoE 融合逻辑 ---
+        behavior_logits = self.behavior_expert_fc(hidden_state)
+        content_query = self.content_expert_projection(hidden_state)
+        all_text_embeddings = self.text_embedding.weight.transpose(0, 1)
+        content_logits = torch.matmul(content_query, all_text_embeddings)
         
-        # (1) 行为专家 (Behavior Expert)
-        # 直接使用隐藏状态计算基于行为的logits
-        behavior_logits = self.behavior_expert_fc(hidden_state) # Shape: (B, T, num_items)
+        gate_weights = self.gate_network(hidden_state)
+        w_behavior = gate_weights[:, :, 0].unsqueeze(-1)
+        w_content = gate_weights[:, :, 1].unsqueeze(-1)
         
-        # (2) 内容专家 (Content Expert)
-        # a. 将隐藏状态投影为"查询向量"
-        content_query = self.content_expert_projection(hidden_state) # Shape: (B, T, D_text)
-        # b. 使用查询向量与所有物品的文本嵌入进行矩阵乘法 (点积)
-        # text_embedding.weight 的 shape 是 (num_items, D_text)
-        # 我们需要将其转置为 (D_text, num_items)
-        all_text_embeddings = self.text_embedding.weight.transpose(0, 1) # Shape: (D_text, num_items)
-        content_logits = torch.matmul(content_query, all_text_embeddings) # Shape: (B, T, num_items)
-        
-        # (3) 门控网络 (Gate Network)
-        # 计算每个专家的权重
-        gate_weights = self.gate_network(hidden_state) # Shape: (B, T, 2)
-        
-        # (4) 动态加权融合
-        # 将权重扩展到正确的维度以便进行广播
-        w_behavior = gate_weights[:, :, 0].unsqueeze(-1) # Shape: (B, T, 1)
-        w_content = gate_weights[:, :, 1].unsqueeze(-1)  # Shape: (B, T, 1)
-        
-        # 加权求和
         final_logits = w_behavior * behavior_logits + w_content * content_logits
         
-        return final_logits
+        if return_weights:
+            return final_logits, gate_weights
+        else:
+            return final_logits

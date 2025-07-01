@@ -4,233 +4,210 @@ import os
 import pickle
 import random
 import math
-from tqdm import tqdm
 import pathlib
-from transformers import get_linear_schedule_with_warmup
-
 import numpy as np
-import pandas as pd
+
+from tqdm import tqdm
+from transformers import get_linear_schedule_with_warmup
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
+# 导入所有需要的模块
 from src.config import get_config
 from src.GeniusRec import GENIUSRecModel
 from src.dataset import Seq2SeqRecDataset
+from src.encoder.encoder import Hstu
+from src.decoder.decoder import GenerativeDecoder
+# 【新】导入我们的指标计算模块
+from src.metrics import get_metrics 
 
-import platform
-
-# python -m src.train_GeniusRec --encoder_weights_path checkpoints/hstu_encoder.pth --freeze_encoder
 def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, epoch, num_epochs, pad_token_id):
-    """
-    【已修改】: 新增 scheduler 参数和 pad_token_id 参数, 并在每个batch后调用 scheduler.step()
-    """
+    # 这个函数保持不变
     model.train()
     total_loss = 0.0
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Training]")
-
     for batch in progress_bar:
-        source_ids = batch['source_ids'].to(device)
-        decoder_input_ids = batch['decoder_input_ids'].to(device)
-        labels = batch['labels'].to(device)
-        source_padding_mask = (source_ids == pad_token_id).to(device)
+        source_ids, decoder_input_ids, labels = batch['source_ids'].to(device), batch['decoder_input_ids'].to(device), batch['labels'].to(device)
+        source_padding_mask = (source_ids == pad_token_id)
         optimizer.zero_grad()
-        
-        # 模型前向传播
-        logits = model(source_ids, decoder_input_ids, source_padding_mask)
-
-        # 计算损失
+        logits = model(source_ids, decoder_input_ids, source_padding_mask, return_weights=False)
         loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
-        
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # 梯度裁剪
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        
-        # 在每个batch后更新学习率
         scheduler.step()
-        
         total_loss += loss.item()
-        progress_bar.set_postfix(loss=loss.item(), avg_loss=total_loss/len(progress_bar))
-        
-    return total_loss / len(dataloader)
+        progress_bar.set_postfix(loss=loss.item())
+    avg_loss = total_loss / len(dataloader)
+    print(f"\nEpoch {epoch+1}/{num_epochs} - Avg Train Loss: {avg_loss:.4f}")
+    return avg_loss
 
-def evaluate(model, dataloader, criterion, device, epoch, num_epochs, pad_token_id):
+# 【已修改】evaluate 函数现在会计算并返回所有指标
+def evaluate(model, dataloader, criterion, device, epoch, num_epochs, pad_token_id, top_k):
     model.eval()
     total_loss = 0.0
+    
+    # 初始化用于累加指标的变量
+    total_behavior_weight, total_content_weight = 0.0, 0.0
+    total_valid_batches = 0
+    all_hr_scores, all_ndcg_scores = [], []
+
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Validation]")
 
     with torch.no_grad():
         for batch in progress_bar:
-            source_ids = batch['source_ids'].to(device)
-            decoder_input_ids = batch['decoder_input_ids'].to(device)
-            labels = batch['labels'].to(device)
-            source_padding_mask = (source_ids == pad_token_id).to(device)
+            source_ids, decoder_input_ids, labels = batch['source_ids'].to(device), batch['decoder_input_ids'].to(device), batch['labels'].to(device)
+            source_padding_mask = (source_ids == pad_token_id)
 
-            logits = model(source_ids, decoder_input_ids, source_padding_mask)
-            loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
+            logits, gate_weights = model(source_ids, decoder_input_ids, source_padding_mask, return_weights=True)
             
+            # 计算损失
+            loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
             total_loss += loss.item()
-            progress_bar.set_postfix(loss=loss.item(), avg_loss=total_loss/len(progress_bar))
+            
+            # 【新】调用指标计算函数
+            hr_k, ndcg_k = get_metrics(logits, labels, k=top_k, pad_token_id=pad_token_id)
+            all_hr_scores.extend(hr_k)
+            all_ndcg_scores.extend(ndcg_k)
 
+            # 监控门控权重 (逻辑不变)
+            non_padding_mask = (decoder_input_ids != pad_token_id)
+            behavior_weights = gate_weights[:, :, 0][non_padding_mask]
+            content_weights = gate_weights[:, :, 1][non_padding_mask]
+            if behavior_weights.numel() > 0:
+                total_behavior_weight += behavior_weights.mean().item()
+                total_content_weight += content_weights.mean().item()
+                total_valid_batches += 1
+
+            progress_bar.set_postfix(loss=loss.item())
+
+    # 计算平均指标
     avg_loss = total_loss / len(dataloader)
-    perplexity = math.exp(avg_loss)
-    return avg_loss, perplexity
-
-
-# --- 2. 主函数 (已修改调度器逻辑) ---
-def main():
-    # 1. 参数解析 (此部分逻辑保持不变)
-    parser = argparse.ArgumentParser(description="Train GENIUS-Rec Model")
-    # ... (您原有的所有 argparse 参数定义)
-    parser.add_argument('--embedding_dim', type=int, default=128, help='Dimension of the model embedding')
-    parser.add_argument('--decoder_layers', type=int, default=4, help='Number of decoder layers')
-    parser.add_argument('--num_heads', type=int, default=4, help='Number of attention heads')
-    parser.add_argument('--ffn_hidden_dim', type=int, default=512, help='Hidden dimension of FFN')
-    parser.add_argument('--max_seq_len', type=int, default=50, help='Maximum sequence length')
-    parser.add_argument('--dropout_ratio', type=float, default=0.1, help='Dropout ratio')
-    parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--num_epochs', type=int, default=10, help='Number of epochs')
-    parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
-    args = parser.parse_args()
-
-    # 2. 设置设备 (此部分逻辑保持不变)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # 3. 加载数据集和ID映射 (此部分逻辑保持不变)
-    data_path = 'data'
-    train_loader, val_loader, test_loader, id_maps = load_data_and_create_loaders(data_path, args.batch_size, args.max_seq_len)
-    num_users = id_maps['num_users']
-    num_items = id_maps['num_items'] + 1  # +1 for padding token 0
-    pad_token_id = 0
+    perplexity = math.exp(avg_loss) if avg_loss < 20 else float('inf')
+    avg_hr = np.mean(all_hr_scores) if all_hr_scores else 0
+    avg_ndcg = np.mean(all_ndcg_scores) if all_ndcg_scores else 0
+    avg_behavior_w = total_behavior_weight / total_valid_batches if total_valid_batches > 0 else 0
+    avg_content_w = total_content_weight / total_valid_batches if total_valid_batches > 0 else 0
     
-    # ==================== 新增模块: 加载并准备文本嵌入 ====================
-    print("Loading pre-computed text embeddings from data/book_gemini_embeddings_final.npy...")
+    # 打印所有结果
+    print(f"\nValidation Results for Epoch {epoch+1}:")
+    print(f"  -> Val Loss: {avg_loss:.4f}, Val PPL: {perplexity:.4f}")
+    print(f"  -> HR@{top_k}: {avg_hr:.4f}, NDCG@{top_k}: {avg_ndcg:.4f}")
+    print(f"  -> Avg Gate Weight [Behavior Expert]: {avg_behavior_w:.4f}")
+    print(f"  -> Avg Gate Weight [Content Expert]:  {avg_content_w:.4f}\n")
+
+    return avg_loss, perplexity, avg_hr, avg_ndcg
+
+
+def main():
+    config = get_config()
+    parser = argparse.ArgumentParser(description="Train GENIUS-Rec Model with MoE")
+    parser.add_argument('--encoder_weights_path', type=str, default=None, help='Path to pre-trained HSTU encoder weights.')
+    parser.add_argument('--freeze_encoder', action='store_true', help='Freeze encoder weights.')
+    args = parser.parse_args()
+    
+    # 2. Setup environment
+    device = torch.device(config['device'])
+    random.seed(config['seed'])
+    np.random.seed(config['seed'])
+    torch.manual_seed(config['seed'])
+
+    # 3. Load data and ID maps
+    print("Loading data from processed directory specified in config...")
+    with open(config['data']['id_maps_file'], 'rb') as f:
+        id_maps = pickle.load(f)
+
+    train_dataset = Seq2SeqRecDataset(config['data']['train_file'], config['decoder_model']['max_seq_len'])
+    val_dataset = Seq2SeqRecDataset(config['data']['validation_file'], config['decoder_model']['max_seq_len'])
+    
+    train_loader = DataLoader(train_dataset, batch_size=config['finetune']['batch_size'], shuffle=True, num_workers=config['finetune']['num_workers'])
+    val_loader = DataLoader(val_dataset, batch_size=config['finetune']['batch_size'], shuffle=False, num_workers=config['finetune']['num_workers'])
+    
+    num_items = id_maps['num_items'] + 1
+    pad_token_id = config['pad_token_id']
+    
+    # 4. Load text embeddings
+    print("Loading pre-computed and FILTERED text embeddings...")
+    text_embedding_file = config['data']['data_dir'] / 'book_gemini_embeddings_filtered.npy'
     try:
-        text_embeddings_dict = np.load('data/book_gemini_embeddings_final.npy', allow_pickle=True).item()
+        text_embeddings_dict = np.load(text_embedding_file, allow_pickle=True).item()
     except FileNotFoundError:
-        print("Error: `data/book_gemini_embeddings_final.npy` not found!")
-        print("Please ensure the text embedding file is in the correct location.")
-        return # 提前退出
+        print(f"Error: Filtered embedding file not found at '{text_embedding_file}'! Please run filter_embeddings.py first.")
+        return
 
-    # 从字典中任意取一个嵌入来确定维度
-    try:
-        text_embedding_dim = next(iter(text_embeddings_dict.values())).shape[0]
-        print(f"Detected text embedding dimension: {text_embedding_dim}")
-    except StopIteration:
-        print("Error: The text embedding dictionary is empty!")
-        return # 提前退出
-
-    # 创建一个空的嵌入矩阵
+    text_embedding_dim = next(iter(text_embeddings_dict.values())).shape[0]
     text_embedding_matrix = torch.zeros(num_items, text_embedding_dim, dtype=torch.float)
     
-    # 创建 asin -> item_id 的映射
-    asin_to_id_map = {v: k for k, v in id_maps['item_map'].items()}
-    
-    # 填充嵌入矩阵
+    item_asin_map = id_maps['item_map']
     loaded_count = 0
     for asin, embedding in text_embeddings_dict.items():
-        if asin in asin_to_id_map:
-            item_id = asin_to_id_map[asin]
+        if asin in item_asin_map:
+            item_id = item_asin_map[asin]
             text_embedding_matrix[item_id] = torch.tensor(embedding, dtype=torch.float)
             loaded_count += 1
     
-    print(f"Successfully loaded and mapped {loaded_count} text embeddings into the matrix.")
-    # =======================================================================
+    print(f"Successfully loaded and mapped {loaded_count} text embeddings.")
+    if loaded_count == 0:
+        print("\nWARNING: No embeddings were mapped. The content expert will not function. Please check your data files.\n")
 
-    # 4. 初始化模型
-    # 4.1 初始化编码器 (此部分逻辑保持不变)
-    print("Initializing HSTU Encoder...")
-    encoder = HSTUEncoder(
-        num_items=num_items,
-        embedding_dim=args.embedding_dim,
-        max_seq_len=args.max_seq_len,
-        num_layers=4, # 根据您的HSTU配置
-        num_heads=args.num_heads,
-        dropout_ratio=args.dropout_ratio,
-        pad_token_id=pad_token_id
-    )
-    # 加载预训练的HSTU权重
-    try:
-        encoder_weights = torch.load('models/hstu_encoder_weights.pth', map_location=device)
-        encoder.load_state_dict(encoder_weights)
-        print("Pre-trained HSTU encoder weights loaded successfully.")
-    except FileNotFoundError:
-        print("Warning: Pre-trained HSTU encoder weights not found. Training encoder from scratch.")
-        
-    # 4.2 初始化修改后的解码器
-    print("Initializing Generative Decoder with MoE...")
-    decoder = GenerativeDecoder(
-        num_items=num_items,
-        embedding_dim=args.embedding_dim,
-        num_layers=args.decoder_layers,
-        num_heads=args.num_heads,
-        ffn_hidden_dim=args.ffn_hidden_dim,
-        max_seq_len=args.max_seq_len,
-        dropout_ratio=args.dropout_ratio,
-        pad_token_id=pad_token_id,
-        text_embedding_dim=text_embedding_dim # <<-- 传入新的参数
-    )
 
-    # 4.3 初始化完整的GeniusRec模型 (此部分逻辑保持不变)
-    model = GeniusRec(encoder, decoder).to(device)
+    # 5. Initialize model
+    config['encoder_model']['item_num'] = num_items
+    config['decoder_model']['num_items'] = num_items
+    config['decoder_model']['text_embedding_dim'] = text_embedding_dim
+    model = GENIUSRecModel(config['encoder_model'], config['decoder_model']).to(device)
 
-    # ==================== 新增模块: 将嵌入矩阵加载到模型中 ====================
-    # 将包含所有文本嵌入的矩阵加载到解码器的对应层中
+    # 6. Load pre-trained weights
+    if args.encoder_weights_path:
+        try:
+            encoder_weights = torch.load(args.encoder_weights_path, map_location=device)
+            model.encoder.load_state_dict(encoder_weights, strict=False) 
+            print(f"Pre-trained HSTU encoder weights loaded from '{args.encoder_weights_path}'.")
+        except Exception as e:
+            print(f"Warning: Could not load encoder weights: {e}. Training from scratch.")
+            
+    if args.freeze_encoder:
+        for param in model.encoder.parameters():
+            param.requires_grad = False
+        print("Encoder weights frozen.")
+
+    # 7. Load text embeddings into model
     model.decoder.load_text_embeddings(text_embedding_matrix.to(device))
-    # =======================================================================
+    
+    # 8. Define optimizer and loss
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config['finetune']['learning_rate']['decoder_lr'])
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id, label_smoothing=0.1)
+    
+    # 9. Define learning rate scheduler
+    num_training_steps = len(train_loader) * config['finetune']['num_epochs']
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=config['finetune']['warmup_steps'], num_training_steps=num_training_steps)
 
-    # 5. 定义优化器和损失函数 (此部分逻辑保持不变)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-    # 忽略padding token的损失计算
-    criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id)
-
-    # 6. 训练和验证循环 (此部分逻辑保持不变)
+    # 【已修改】训练循环现在会处理和保存所有指标
     print("Starting training...")
-    for epoch in range(args.num_epochs):
-        model.train()
-        total_train_loss = 0
-        for user_id, sequence, target in train_loader:
-            user_id, sequence, target = user_id.to(device), sequence.to(device), target.to(device)
+    
+    best_val_metric = -1 # 使用一个以越高越好的指标 (如NDCG) 作为标准
+    output_dir = config['data']['checkpoint_dir']
+    output_dir.mkdir(parents=True, exist_ok=True)
+    best_model_path = output_dir / 'genius_rec_moe_best.pth'
+    latest_model_path = output_dir / 'genius_rec_moe_latest.pth'
+    top_k = config['evaluation']['top_k']
 
-            optimizer.zero_grad()
-            
-            logits = model(sequence, target[:, :-1]) # 输入目标序列除了最后一个token
-            
-            # 调整维度以匹配CrossEntropyLoss的期望输入
-            # Logits: (B, T, V) -> (B*T, V)
-            # Target: (B, T) -> (B*T)
-            loss = criterion(logits.reshape(-1, logits.size(-1)), target[:, 1:].reshape(-1))
-            
-            loss.backward()
-            optimizer.step()
-            
-            total_train_loss += loss.item()
+    for epoch in range(config['finetune']['num_epochs']):
+        train_one_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch, config['finetune']['num_epochs'], pad_token_id)
         
-        avg_train_loss = total_train_loss / len(train_loader)
+        val_loss, val_ppl, val_hr, val_ndcg = evaluate(model, val_loader, criterion, device, epoch, config['finetune']['num_epochs'], pad_token_id, top_k)
 
-        # Validation loop
-        model.eval()
-        total_val_loss = 0
-        with torch.no_grad():
-            for user_id, sequence, target in val_loader:
-                user_id, sequence, target = user_id.to(device), sequence.to(device), target.to(device)
-                
-                logits = model(sequence, target[:, :-1])
-                loss = criterion(logits.reshape(-1, logits.size(-1)), target[:, 1:].reshape(-1))
-                
-                total_val_loss += loss.item()
+        torch.save(model.state_dict(), latest_model_path)
+        print(f"Saved latest model checkpoint to '{latest_model_path}'")
         
-        avg_val_loss = total_val_loss / len(val_loader)
-        
-        print(f"Epoch {epoch+1}/{args.num_epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val PPL: {math.exp(avg_val_loss):.4f}")
+        # 使用NDCG@K作为判断最佳模型的标准
+        if val_ndcg > best_val_metric:
+            best_val_metric = val_ndcg
+            torch.save(model.state_dict(), best_model_path)
+            print(f"🎉 New best model found! Saved to '{best_model_path}' with NDCG@{top_k}: {best_val_metric:.4f}")
 
     print("Training finished.")
-
-    # 7. 保存最终模型 (可选)
-    torch.save(model.state_dict(), 'models/genius_rec_moe_final.pth')
-    print("Final model saved to models/genius_rec_moe_final.pth")
-
 
 if __name__ == '__main__':
     main()

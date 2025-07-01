@@ -1,5 +1,7 @@
-# In src/seq2seq_model.py
+# src/GeniusRec.py
+
 import torch.nn as nn
+# 确保导入正确的类
 from src.encoder.encoder import Hstu         
 from src.decoder.decoder import GenerativeDecoder 
 
@@ -9,17 +11,13 @@ class GENIUSRecModel(nn.Module):
         self.encoder = Hstu(**encoder_config)
         self.decoder = GenerativeDecoder(**decoder_config)
 
-    def forward(self, source_ids, target_ids, source_padding_mask):
-        """
-        接收 source_padding_mask 并将其传递给解码器.
-        """
-        # 1. 调用编码器
+    # 【关键修正】
+    def forward(self, source_ids, target_ids, source_padding_mask, return_weights: bool = False):
         encoder_output = self.encoder(source_ids)
         
-        # 2. 调用解码器, 现在传入了需要的 memory_padding_mask
-        logits = self.decoder(
+        return self.decoder(
             target_ids=target_ids, 
             encoder_output=encoder_output, 
-            memory_padding_mask=source_padding_mask
+            memory_padding_mask=source_padding_mask,
+            return_weights=return_weights
         )
-        return logits

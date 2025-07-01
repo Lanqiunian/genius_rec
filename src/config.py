@@ -52,7 +52,7 @@ def get_config():
             "num_layers": 4,     # 解码器层数，可以与编码器不同
             "num_heads": 4,
             "ffn_hidden_dim": 64 * 4, # 前馈网络隐藏层维度，通常是embedding_dim的4倍
-            "dropout_ratio": 0.1,
+            "dropout_ratio": 0.3,
              # num_items 在训练脚本中动态传入
         },
 
@@ -83,7 +83,7 @@ def get_config():
                 "encoder_lr": 5e-6, # 编码器使用更小的学习率
             },
             "warmup_steps": 1000, # 学习率预热步数
-            "weight_decay": 0.01,
+            "weight_decay": 0.1,
             "early_stopping_patience": 5,
             "num_workers": 10,
             "split_ratio": 0.5, # 数据集分割比例

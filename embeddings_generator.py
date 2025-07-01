@@ -15,8 +15,7 @@ import threading
 # ===================================================================
 
 # 【注意】建议使用环境变量来管理您的密钥以提高安全性。
-# GOOGLE_API_KEY = os.getenv('YOUR_GOOGLE_API_KEY')
-GOOGLE_API_KEY = 'AIzaSyDSR_G4ESL3CtkVcmxjUwT5QpS_wCvKO_c' # 已填入您之前提供的密钥
+GOOGLE_API_KEY = os.getenv('YOUR_GOOGLE_API_KEY')
 
 # --- 模型和并发配置 ---
 EMBEDDING_MODEL = "models/text-embedding-004"

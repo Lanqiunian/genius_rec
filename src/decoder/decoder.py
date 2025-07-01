@@ -71,64 +71,101 @@ class DecoderBlock(nn.Module):
 
 
 class GenerativeDecoder(nn.Module):
-    """
-    完整的生成式解码器.
-    它由物品嵌入层、位置编码、多个解码器模块和一个最终的线性输出层组成.
-    """
     def __init__(self, num_items: int, embedding_dim: int, num_layers: int, num_heads: int, 
-             ffn_hidden_dim: int, max_seq_len: int, dropout_ratio: float = 0.1, pad_token_id: int = 0):
+                 ffn_hidden_dim: int, max_seq_len: int, dropout_ratio: float = 0.1, 
+                 pad_token_id: int = 0, text_embedding_dim: int = 768): # 假设您的Gemini嵌入是768维
         super(GenerativeDecoder, self).__init__()
         
-        self.item_embedding = nn.Embedding(num_items, embedding_dim, padding_idx=0)
+        self.item_embedding = nn.Embedding(num_items, embedding_dim, padding_idx=pad_token_id)
         self.pos_embedding = nn.Embedding(max_seq_len, embedding_dim)
         
         self.decoder_layers = nn.ModuleList(
             [DecoderBlock(embedding_dim, num_heads, ffn_hidden_dim, dropout_ratio) for _ in range(num_layers)]
         )
         
-        # 最终的线性层，将输出映射到词汇表大小，用于预测下一个物品
-        self.output_layer = nn.Linear(embedding_dim, num_items)
-        self.pad_token_id = pad_token_id
         self.dropout = nn.Dropout(dropout_ratio)
         self.embedding_dim = embedding_dim
+        self.num_items = num_items
+
+        # ==================== MoE 核心组件定义 ====================
+        
+        # 1. 文本嵌入层 (用于存储所有物品的文本嵌入，设为不可训练)
+        self.text_embedding = nn.Embedding(num_items, text_embedding_dim, padding_idx=pad_token_id)
+        self.text_embedding.weight.requires_grad = False
+        
+        # 2. 行为专家网络 (就是原先的输出层)
+        self.behavior_expert_fc = nn.Linear(embedding_dim, num_items)
+        
+        # 3. 内容专家的查询投影层
+        # 将解码器隐藏状态投影到与文本嵌入相同的维度，以便进行点积
+        self.content_expert_projection = nn.Linear(embedding_dim, text_embedding_dim)
+
+        # 4. 门控网络 (Router)
+        # 输入是解码器的隐藏状态，输出是2个专家的权重
+        self.gate_network = nn.Sequential(
+            nn.Linear(embedding_dim, 2),
+            nn.Softmax(dim=-1)
+        )
+        # ==========================================================
+
+    def load_text_embeddings(self, embedding_matrix: torch.Tensor):
+        """
+        一个辅助函数，用于从外部加载预训练好的文本嵌入矩阵。
+        """
+        if self.text_embedding.weight.shape != embedding_matrix.shape:
+            raise ValueError(f"Shape mismatch! Model expects {self.text_embedding.weight.shape}, but got {embedding_matrix.shape}")
+        
+        print("Loading pretrained text embeddings into the decoder...")
+        self.text_embedding.weight.data.copy_(embedding_matrix)
+        print("Text embeddings loaded successfully.")
 
     @staticmethod
     def _generate_square_subsequent_mask(sz: int):
-        """生成一个上三角矩阵的掩码，用于防止自注意力看到未来的token"""
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-    def forward(self, target_ids, encoder_output, memory_padding_mask):
-        """
-        Args:
-            target_ids: 目标物品ID序列, (B, target_len)
-            encoder_output: 来自HSTU编码器的输出, (B, source_len, D)
-            memory_padding_mask: HSTU输入序列的填充掩码, (B, source_len)
-        """
+    def forward(self, target_ids: torch.Tensor, encoder_output: torch.Tensor, memory_padding_mask: torch.Tensor):
         batch_size, target_len = target_ids.size()
         
-        # 1. 准备解码器输入
-        # 生成位置ID
-        positions = torch.arange(0, target_len, device=target_ids.device).unsqueeze(0).repeat(batch_size, 1)
-        
-        # 物品嵌入 + 位置嵌入
+        # --- 1. 准备解码器输入 (逻辑不变) ---
+        positions = torch.arange(0, target_len, device=target_ids.device).unsqueeze(0)
         target_emb = self.item_embedding(target_ids) * math.sqrt(self.embedding_dim)
         pos_emb = self.pos_embedding(positions)
         decoder_input = self.dropout(target_emb + pos_emb)
-        
-        # 2. 生成自注意力掩码
         target_mask = self._generate_square_subsequent_mask(target_len).to(target_ids.device)
         
-        # 3. 逐层通过DecoderBlock
-        output = decoder_input
+        # --- 2. 通过解码器Transformer层 (逻辑不变) ---
+        # hidden_state 是解码器在每个时间步的最终输出表征
+        hidden_state = decoder_input
         for layer in self.decoder_layers:
-            output = layer(output, encoder_output, target_mask, memory_padding_mask)
-            
-        # 4. 最终输出预测
-        # 在这里可以集成MoE系统，根据不同的专家意见来调整output
-        # Future work: output = self.moe_layer(output, encoder_output)
+            hidden_state = layer(hidden_state, encoder_output, target_mask, memory_padding_mask)
         
-        logits = self.output_layer(output) # (B, target_len, num_items)
+        # --- 3. MoE 融合逻辑 ---
         
-        return logits
+        # (1) 行为专家 (Behavior Expert)
+        # 直接使用隐藏状态计算基于行为的logits
+        behavior_logits = self.behavior_expert_fc(hidden_state) # Shape: (B, T, num_items)
+        
+        # (2) 内容专家 (Content Expert)
+        # a. 将隐藏状态投影为"查询向量"
+        content_query = self.content_expert_projection(hidden_state) # Shape: (B, T, D_text)
+        # b. 使用查询向量与所有物品的文本嵌入进行矩阵乘法 (点积)
+        # text_embedding.weight 的 shape 是 (num_items, D_text)
+        # 我们需要将其转置为 (D_text, num_items)
+        all_text_embeddings = self.text_embedding.weight.transpose(0, 1) # Shape: (D_text, num_items)
+        content_logits = torch.matmul(content_query, all_text_embeddings) # Shape: (B, T, num_items)
+        
+        # (3) 门控网络 (Gate Network)
+        # 计算每个专家的权重
+        gate_weights = self.gate_network(hidden_state) # Shape: (B, T, 2)
+        
+        # (4) 动态加权融合
+        # 将权重扩展到正确的维度以便进行广播
+        w_behavior = gate_weights[:, :, 0].unsqueeze(-1) # Shape: (B, T, 1)
+        w_content = gate_weights[:, :, 1].unsqueeze(-1)  # Shape: (B, T, 1)
+        
+        # 加权求和
+        final_logits = w_behavior * behavior_logits + w_content * content_logits
+        
+        return final_logits

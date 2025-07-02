@@ -73,7 +73,7 @@ class DecoderBlock(nn.Module):
 class GenerativeDecoder(nn.Module):
     def __init__(self, num_items: int, embedding_dim: int, num_layers: int, num_heads: int, 
                  ffn_hidden_dim: int, max_seq_len: int, dropout_ratio: float = 0.1, 
-                 pad_token_id: int = 0, text_embedding_dim: int = 768): # 假设您的Gemini嵌入是768维
+                 pad_token_id: int = 0, text_embedding_dim: int = 768):
         super(GenerativeDecoder, self).__init__()
         
         self.item_embedding = nn.Embedding(num_items, embedding_dim, padding_idx=pad_token_id)
@@ -87,26 +87,34 @@ class GenerativeDecoder(nn.Module):
         self.embedding_dim = embedding_dim
         self.num_items = num_items
 
-        # ==================== MoE 核心组件定义 ====================
+        # ==================== MoE 核心组件定义 (已升级) ====================
         
-        # 1. 文本嵌入层 (用于存储所有物品的文本嵌入，设为不可训练)
+        # 1. 文本嵌入层 (保持不变)
         self.text_embedding = nn.Embedding(num_items, text_embedding_dim, padding_idx=pad_token_id)
         self.text_embedding.weight.requires_grad = False
         
-        # 2. 行为专家网络 (就是原先的输出层)
+        # 2. 行为专家网络 (保持不变)
         self.behavior_expert_fc = nn.Linear(embedding_dim, num_items)
         
-        # 3. 内容专家的查询投影层
-        # 将解码器隐藏状态投影到与文本嵌入相同的维度，以便进行点积
-        self.content_expert_projection = nn.Linear(embedding_dim, text_embedding_dim)
+        # 3. 内容专家的交叉注意力层 (【新增】)
+        #    用它来取代原来的线性投影
+        self.content_expert_attention = nn.MultiheadAttention(
+            embed_dim=embedding_dim, 
+            num_heads=num_heads, 
+            dropout=dropout_ratio, 
+            batch_first=True
+        )
+        
+        # 4. 注意力输出投影层 (【新增】)
+        #    将交叉注意力的输出结果投影到与文本嵌入一致的维度
+        self.attention_output_projection = nn.Linear(embedding_dim, text_embedding_dim)
 
-        # 4. 门控网络 (Router)
-        # 输入是解码器的隐藏状态，输出是2个专家的权重
+        # 5. 门控网络 (保持不变)
         self.gate_network = nn.Sequential(
             nn.Linear(embedding_dim, 2),
             nn.Softmax(dim=-1)
         )
-        # ==========================================================
+        # =================================================================
 
     def load_text_embeddings(self, embedding_matrix: torch.Tensor):
         """
@@ -133,15 +141,32 @@ class GenerativeDecoder(nn.Module):
         decoder_input = self.dropout(target_emb + pos_emb)
         target_mask = self._generate_square_subsequent_mask(target_len).to(target_ids.device)
         
+        # 经过N层解码器模块
         hidden_state = decoder_input
         for layer in self.decoder_layers:
             hidden_state = layer(hidden_state, encoder_output, target_mask, memory_padding_mask)
         
+        # --- 行为专家 logits (保持不变) ---
         behavior_logits = self.behavior_expert_fc(hidden_state)
-        content_query = self.content_expert_projection(hidden_state)
+        
+        # --- 内容专家 logits (【核心改动】) ---
+        # 1. 使用交叉注意力生成上下文相关的向量
+        #    Query 来自解码器隐藏状态，Key和Value 来自编码器输出
+        content_context_vector, _ = self.content_expert_attention(
+            query=hidden_state,
+            key=encoder_output,
+            value=encoder_output,
+            key_padding_mask=memory_padding_mask
+        )
+        
+        # 2. 将注意力的输出投影到文本嵌入的维度，得到最终的 content_query
+        content_query = self.attention_output_projection(content_context_vector)
+        
+        # 3. 计算与所有物品文本嵌入的相似度 (保持不变)
         all_text_embeddings = self.text_embedding.weight.transpose(0, 1)
         content_logits = torch.matmul(content_query, all_text_embeddings)
         
+        # --- 门控网络与专家融合 (保持不变) ---
         gate_weights = self.gate_network(hidden_state)
         w_behavior = gate_weights[:, :, 0].unsqueeze(-1)
         w_content = gate_weights[:, :, 1].unsqueeze(-1)

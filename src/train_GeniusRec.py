@@ -111,7 +111,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
     total_loss = 0.0
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Training]")
 
-    for batch in progress_bar:
+    for batch_idx, batch in enumerate(progress_bar):
         source_ids = batch['source_ids'].to(device)
         decoder_input_ids = batch['decoder_input_ids'].to(device)
         labels = batch['labels'].to(device)
@@ -130,7 +130,18 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
         scheduler.step()
         
         total_loss += loss.item()
-        progress_bar.set_postfix(loss=loss.item(), avg_loss=total_loss/len(progress_bar))
+        
+        # 显存监控（每100个batch显示一次）
+        if batch_idx % 100 == 0 and torch.cuda.is_available():
+            memory_allocated = torch.cuda.memory_allocated() / 1024**3
+            memory_reserved = torch.cuda.memory_reserved() / 1024**3
+            progress_bar.set_postfix(
+                loss=loss.item(), 
+                avg_loss=total_loss/(batch_idx+1),
+                gpu_mem=f"{memory_allocated:.1f}GB"
+            )
+        else:
+            progress_bar.set_postfix(loss=loss.item(), avg_loss=total_loss/(batch_idx+1))
         
     avg_loss = total_loss / len(dataloader)
     return avg_loss
@@ -143,8 +154,7 @@ def evaluate_model_validation(model, val_loader, criterion, device, epoch, num_e
     
     total_loss_tokens = 0.0
     total_tokens = 0
-    total_behavior_weight = 0.0
-    total_content_weight = 0.0
+    total_gate_weights = None
     total_valid_batches = 0
 
     progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Validation]")
@@ -165,28 +175,39 @@ def evaluate_model_validation(model, val_loader, criterion, device, epoch, num_e
             total_loss_tokens += loss.item() * valid_tokens
             total_tokens += valid_tokens
 
+            # 累计门控权重（动态支持多个专家）
             non_padding_mask = (decoder_input_ids != pad_token_id)
-            behavior_weights = gate_weights[:, :, 0][non_padding_mask]
-            content_weights = gate_weights[:, :, 1][non_padding_mask]
-            
-            if behavior_weights.numel() > 0:
-                total_behavior_weight += behavior_weights.mean().item()
-                total_content_weight += content_weights.mean().item()
-                total_valid_batches += 1
+            if gate_weights.size(-1) > 0:  # 确保有专家
+                masked_gate_weights = gate_weights[non_padding_mask]  # (N, num_experts)
+                if masked_gate_weights.numel() > 0:
+                    if total_gate_weights is None:
+                        total_gate_weights = masked_gate_weights.mean(dim=0)  # (num_experts,)
+                        total_valid_batches = 1
+                    else:
+                        total_gate_weights += masked_gate_weights.mean(dim=0)
+                        total_valid_batches += 1
 
             progress_bar.set_postfix(loss=loss.item())
 
     avg_loss = total_loss_tokens / total_tokens if total_tokens > 0 else 0
     perplexity = math.exp(avg_loss) if avg_loss < 20 else float('inf')
-    avg_behavior_w = total_behavior_weight / total_valid_batches if total_valid_batches > 0 else 0
-    avg_content_w = total_content_weight / total_valid_batches if total_valid_batches > 0 else 0
     
-    return {
+    # 计算平均门控权重
+    avg_gate_weights = total_gate_weights / total_valid_batches if total_valid_batches > 0 else None
+    
+    result = {
         'val_loss': avg_loss,
         'val_ppl': perplexity,
-        'avg_behavior_weight': avg_behavior_w,
-        'avg_content_weight': avg_content_w
     }
+    
+    # 动态添加专家权重信息
+    if avg_gate_weights is not None:
+        enabled_experts = [k for k, v in model.decoder.expert_config["experts"].items() if v]
+        for i, expert_name in enumerate(enabled_experts):
+            if i < len(avg_gate_weights):
+                result[f'avg_{expert_name}_weight'] = avg_gate_weights[i].item()
+    
+    return result
 
 def evaluate_model_test(model, test_loader, device, item_num, top_k=10):
     """
@@ -321,9 +342,24 @@ def main():
     parser.add_argument('--freeze_encoder', action='store_true', help='Freeze encoder weights.')
     parser.add_argument('--resume_from', type=str, default=None, help='Path to checkpoint to resume from.')
     parser.add_argument('--save_dir', type=str, default=None, help='Directory to save checkpoints.')
+    
+    # 【新增】专家系统控制参数
+    parser.add_argument('--disable_behavior_expert', action='store_true', help='Disable behavior expert.')
+    parser.add_argument('--disable_content_expert', action='store_true', help='Disable content expert.')
+    parser.add_argument('--enable_image_expert', action='store_true', help='Enable image expert (requires image embeddings).')
+    parser.add_argument('--image_embeddings_path', type=str, default=None, help='Path to image embeddings file.')
+    
     args = parser.parse_args()
 
     config = get_config()
+    
+    # 【新增】根据命令行参数动态调整专家配置
+    if args.disable_behavior_expert:
+        config['expert_system']['experts']['behavior_expert'] = False
+    if args.disable_content_expert:
+        config['expert_system']['experts']['content_expert'] = False
+    if args.enable_image_expert:
+        config['expert_system']['experts']['image_expert'] = True
     
     # 2. 环境设置
     device = torch.device(config['device'])
@@ -405,9 +441,30 @@ def main():
     config['encoder_model']['item_num'] = num_items
     config['decoder_model']['num_items'] = num_items
     config['decoder_model']['text_embedding_dim'] = text_embedding_dim
-    model = GENIUSRecModel(config['encoder_model'], config['decoder_model']).to(device)
-    logging.info("GENIUS-Rec model created.")
-
+    
+    # 【新增】传递专家配置到模型
+    model = GENIUSRecModel(
+        config['encoder_model'], 
+        config['decoder_model'],
+        config['expert_system']  # 专家系统配置
+    ).to(device)
+    logging.info("GENIUS-Rec model created with expert configuration.")
+    
+    # 打印启用的专家信息
+    enabled_experts = [k for k, v in config['expert_system']['experts'].items() if v]
+    logging.info(f"🧠 启用的专家: {enabled_experts}")
+    
+    # 显存使用报告
+    if torch.cuda.is_available():
+        memory_allocated = torch.cuda.memory_allocated() / 1024**3
+        memory_reserved = torch.cuda.memory_reserved() / 1024**3
+        memory_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        logging.info(f"💾 GPU显存状态:")
+        logging.info(f"   - 已分配: {memory_allocated:.2f}GB")
+        logging.info(f"   - 已预留: {memory_reserved:.2f}GB") 
+        logging.info(f"   - 总容量: {memory_total:.2f}GB")
+        logging.info(f"   - 剩余可用: {memory_total - memory_reserved:.2f}GB")
+    
     # 7. 预训练权重加载（如果指定）- 修正：移除跨平台hack
     if args.encoder_weights_path:
         try:
@@ -461,6 +518,32 @@ def main():
 
     # 8. 文本嵌入加载到模型
     model.decoder.load_text_embeddings(text_embedding_matrix.to(device))
+    
+    # 【新增】图像嵌入加载（如果启用图像专家）
+    if config['expert_system']['experts']['image_expert']:
+        if args.image_embeddings_path and os.path.exists(args.image_embeddings_path):
+            logging.info(f"Loading image embeddings from: {args.image_embeddings_path}")
+            try:
+                image_embeddings_dict = np.load(args.image_embeddings_path, allow_pickle=True).item()
+                image_embedding_dim = next(iter(image_embeddings_dict.values())).shape[0]
+                image_embedding_matrix = torch.zeros(num_items, image_embedding_dim, dtype=torch.float)
+                
+                loaded_image_count = 0
+                for asin, embedding in image_embeddings_dict.items():
+                    if asin in item_asin_map:
+                        item_id = item_asin_map[asin]
+                        image_embedding_matrix[item_id] = torch.tensor(embedding, dtype=torch.float)
+                        loaded_image_count += 1
+                
+                model.decoder.load_image_embeddings(image_embedding_matrix.to(device))
+                logging.info(f"Successfully loaded and mapped {loaded_image_count} image embeddings.")
+            except Exception as e:
+                logging.error(f"Failed to load image embeddings: {e}")
+                logging.info("Disabling image expert...")
+                config['expert_system']['experts']['image_expert'] = False
+        else:
+            logging.warning("Image expert enabled but no image embeddings path provided. Disabling image expert...")
+            config['expert_system']['experts']['image_expert'] = False
 
     # 9. 优化器和损失函数
     optimizer = torch.optim.AdamW(
@@ -530,8 +613,13 @@ def main():
         logging.info(f"  📈 Train Loss: {avg_train_loss:.4f}")
         logging.info(f"  📉 Val Loss: {eval_results['val_loss']:.4f}")
         logging.info(f"  📊 Val PPL: {eval_results['val_ppl']:.4f}")
-        logging.info(f"  ⚖️  Behavior Weight: {eval_results['avg_behavior_weight']:.4f}")
-        logging.info(f"  ⚖️  Content Weight: {eval_results['avg_content_weight']:.4f}")
+        
+        # 动态显示专家权重
+        enabled_experts = [k for k, v in config['expert_system']['experts'].items() if v]
+        for expert_name in enabled_experts:
+            weight_key = f'avg_{expert_name}_weight'
+            if weight_key in eval_results:
+                logging.info(f"  ⚖️  {expert_name.replace('_', ' ').title()} Weight: {eval_results[weight_key]:.4f}")
 
         # 准备保存的指标
         save_metrics = {

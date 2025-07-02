@@ -95,6 +95,47 @@ def get_config():
         # =================================================================
         "evaluation": {
             "top_k": 10,
+        },
+        
+        # =================================================================
+        # 5. 专家系统配置 (Expert System Config) 【新增】
+        # =================================================================
+        "expert_system": {
+            # 专家启用开关
+            "experts": {
+                "behavior_expert": True,     # 行为专家（基于用户序列行为）
+                "content_expert": True,      # 内容专家（基于文本嵌入）
+                "image_expert": False,       # 图像专家（基于书封面，预留）
+            },
+            
+            # 门控网络配置
+            "gate_config": {
+                "gate_type": "simple",       # 门控类型：'simple'(原始), 'mlp'(新增)
+                "gate_hidden_dim": 64,       # MLP门控的隐藏层维度（仅gate_type='mlp'时使用）
+                "temperature": 1.0,          # softmax温度参数（预留）
+            },
+            
+            # 内容专家配置
+            "content_expert": {
+                "attention_heads": 4,        # 交叉注意力头数
+                "use_cross_attention": True, # 是否使用交叉注意力
+                "text_embedding_dim": 768,   # 文本嵌入维度
+            },
+            
+            # 图像专家配置（预留）
+            "image_expert": {
+                "attention_heads": 4,        # 交叉注意力头数  
+                "use_cross_attention": True, # 是否使用交叉注意力
+                "image_embedding_dim": 512,  # 图像嵌入维度（可根据实际调整）
+                "image_encoder": "clip",     # 图像编码器类型
+            },
+            
+            # 专家融合策略
+            "fusion_strategy": {
+                "method": "weighted_sum",    # 融合方法：'weighted_sum', 'attention_fusion'
+                "normalize_weights": True,   # 是否归一化专家权重
+                "expert_dropout": 0.1,       # 专家dropout率
+            }
         }
     }
     

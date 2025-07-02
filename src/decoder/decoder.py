@@ -73,9 +73,11 @@ class DecoderBlock(nn.Module):
 class GenerativeDecoder(nn.Module):
     def __init__(self, num_items: int, embedding_dim: int, num_layers: int, num_heads: int, 
                  ffn_hidden_dim: int, max_seq_len: int, dropout_ratio: float = 0.1, 
-                 pad_token_id: int = 0, text_embedding_dim: int = 768):
+                 pad_token_id: int = 0, text_embedding_dim: int = 768, 
+                 expert_config: dict = None):  # 【新增】专家配置参数
         super(GenerativeDecoder, self).__init__()
         
+        # 基础组件
         self.item_embedding = nn.Embedding(num_items, embedding_dim, padding_idx=pad_token_id)
         self.pos_embedding = nn.Embedding(max_seq_len, embedding_dim)
         
@@ -86,46 +88,108 @@ class GenerativeDecoder(nn.Module):
         self.dropout = nn.Dropout(dropout_ratio)
         self.embedding_dim = embedding_dim
         self.num_items = num_items
+        
+        # ==================== 配置驱动的专家系统 ====================
+        # 专家配置
+        self.expert_config = expert_config or {
+            "experts": {"behavior_expert": True, "content_expert": True, "image_expert": False},
+            "gate_config": {"gate_type": "mlp", "temperature": 1.0},
+            "content_expert": {"text_embedding_dim": text_embedding_dim, "attention_heads": num_heads},
+            "image_expert": {"image_embedding_dim": 512, "attention_heads": num_heads}
+        }
+        
+        # 启用的专家列表
+        self.enabled_experts = [k for k, v in self.expert_config["experts"].items() if v]
+        num_experts = len(self.enabled_experts)
+        
+        print(f"🧠 启用的专家: {self.enabled_experts} (共{num_experts}个)")
+        
+        # 1. 行为专家 (Behavior Expert)
+        if self.expert_config["experts"]["behavior_expert"]:
+            self.behavior_expert_fc = nn.Linear(embedding_dim, num_items)
+        
+        # 2. 内容专家 (Content Expert) - 基于文本嵌入
+        if self.expert_config["experts"]["content_expert"]:
+            content_config = self.expert_config["content_expert"]
+            self.text_embedding = nn.Embedding(num_items, content_config["text_embedding_dim"], padding_idx=pad_token_id)
+            self.text_embedding.weight.requires_grad = False
+            
+            if content_config.get("use_cross_attention", True):
+                self.content_expert_attention = nn.MultiheadAttention(
+                    embed_dim=embedding_dim, 
+                    num_heads=content_config["attention_heads"], 
+                    dropout=dropout_ratio, 
+                    batch_first=True
+                )
+                self.content_attention_projection = nn.Linear(embedding_dim, content_config["text_embedding_dim"])
+            else:
+                # 简单线性投影方案
+                self.content_expert_fc = nn.Linear(embedding_dim, content_config["text_embedding_dim"])
+        
+        # 3. 图像专家 (Image Expert) - 基于书封面嵌入 【预留】
+        if self.expert_config["experts"]["image_expert"]:
+            image_config = self.expert_config["image_expert"]
+            self.image_embedding = nn.Embedding(num_items, image_config["image_embedding_dim"], padding_idx=pad_token_id)
+            self.image_embedding.weight.requires_grad = False
+            
+            if image_config.get("use_cross_attention", True):
+                self.image_expert_attention = nn.MultiheadAttention(
+                    embed_dim=embedding_dim,
+                    num_heads=image_config["attention_heads"],
+                    dropout=dropout_ratio,
+                    batch_first=True
+                )
+                self.image_attention_projection = nn.Linear(embedding_dim, image_config["image_embedding_dim"])
+            else:
+                self.image_expert_fc = nn.Linear(embedding_dim, image_config["image_embedding_dim"])
 
-        # ==================== MoE 核心组件定义 (已升级) ====================
-        
-        # 1. 文本嵌入层 (保持不变)
-        self.text_embedding = nn.Embedding(num_items, text_embedding_dim, padding_idx=pad_token_id)
-        self.text_embedding.weight.requires_grad = False
-        
-        # 2. 行为专家网络 (保持不变)
-        self.behavior_expert_fc = nn.Linear(embedding_dim, num_items)
-        
-        # 3. 内容专家的交叉注意力层 (【新增】)
-        #    用它来取代原来的线性投影
-        self.content_expert_attention = nn.MultiheadAttention(
-            embed_dim=embedding_dim, 
-            num_heads=num_heads, 
-            dropout=dropout_ratio, 
-            batch_first=True
-        )
-        
-        # 4. 注意力输出投影层 (【新增】)
-        #    将交叉注意力的输出结果投影到与文本嵌入一致的维度
-        self.attention_output_projection = nn.Linear(embedding_dim, text_embedding_dim)
-
-        # 5. 门控网络 (保持不变)
-        self.gate_network = nn.Sequential(
-            nn.Linear(embedding_dim, 2),
-            nn.Softmax(dim=-1)
-        )
+        # 4. 动态门控网络
+        gate_config = self.expert_config["gate_config"]
+        if gate_config["gate_type"] == "mlp":
+            # 新增的MLP门控（多层）
+            self.gate_network = nn.Sequential(
+                nn.Linear(embedding_dim, gate_config.get("gate_hidden_dim", 64)),
+                nn.ReLU(),
+                nn.Linear(gate_config.get("gate_hidden_dim", 64), num_experts),
+                nn.Softmax(dim=-1)
+            )
+        else:
+            # 原始的简单线性门控（与原代码一致）
+            self.gate_network = nn.Sequential(
+                nn.Linear(embedding_dim, num_experts),
+                nn.Softmax(dim=-1)
+            )
         # =================================================================
 
     def load_text_embeddings(self, embedding_matrix: torch.Tensor):
         """
-        一个辅助函数，用于从外部加载预训练好的文本嵌入矩阵。
+        加载预训练的文本嵌入矩阵。
         """
+        if not self.expert_config["experts"]["content_expert"]:
+            print("⚠️  内容专家未启用，跳过文本嵌入加载")
+            return
+            
         if self.text_embedding.weight.shape != embedding_matrix.shape:
-            raise ValueError(f"Shape mismatch! Model expects {self.text_embedding.weight.shape}, but got {embedding_matrix.shape}")
+            raise ValueError(f"文本嵌入形状不匹配! 模型期望 {self.text_embedding.weight.shape}, 但得到 {embedding_matrix.shape}")
         
-        print("Loading pretrained text embeddings into the decoder...")
+        print("📄 正在加载预训练文本嵌入...")
         self.text_embedding.weight.data.copy_(embedding_matrix)
-        print("Text embeddings loaded successfully.")
+        print("✅ 文本嵌入加载成功")
+
+    def load_image_embeddings(self, embedding_matrix: torch.Tensor):
+        """
+        加载预训练的图像嵌入矩阵（书封面嵌入）。【新增】
+        """
+        if not self.expert_config["experts"]["image_expert"]:
+            print("⚠️  图像专家未启用，跳过图像嵌入加载")
+            return
+            
+        if self.image_embedding.weight.shape != embedding_matrix.shape:
+            raise ValueError(f"图像嵌入形状不匹配! 模型期望 {self.image_embedding.weight.shape}, 但得到 {embedding_matrix.shape}")
+        
+        print("🖼️  正在加载预训练图像嵌入...")
+        self.image_embedding.weight.data.copy_(embedding_matrix)
+        print("✅ 图像嵌入加载成功")
 
     @staticmethod
     def _generate_square_subsequent_mask(sz: int):
@@ -146,32 +210,70 @@ class GenerativeDecoder(nn.Module):
         for layer in self.decoder_layers:
             hidden_state = layer(hidden_state, encoder_output, target_mask, memory_padding_mask)
         
-        # --- 行为专家 logits (保持不变) ---
-        behavior_logits = self.behavior_expert_fc(hidden_state)
+        # ==================== 动态专家系统推理（显存优化版）====================
+        # 计算门控权重
+        gate_weights = self.gate_network(hidden_state)  # (B, T, num_experts)
         
-        # --- 内容专家 logits (【核心改动】) ---
-        # 1. 使用交叉注意力生成上下文相关的向量
-        #    Query 来自解码器隐藏状态，Key和Value 来自编码器输出
-        content_context_vector, _ = self.content_expert_attention(
-            query=hidden_state,
-            key=encoder_output,
-            value=encoder_output,
-            key_padding_mask=memory_padding_mask
-        )
+        # 【显存优化】初始化结果tensor，逐个专家计算并累加
+        final_logits = torch.zeros(batch_size, target_len, self.num_items, device=target_ids.device)
+        expert_idx = 0
         
-        # 2. 将注意力的输出投影到文本嵌入的维度，得到最终的 content_query
-        content_query = self.attention_output_projection(content_context_vector)
+        # 1. 行为专家
+        if self.expert_config["experts"]["behavior_expert"]:
+            behavior_logits = self.behavior_expert_fc(hidden_state)
+            weight = gate_weights[:, :, expert_idx].unsqueeze(-1)  # (B, T, 1)
+            final_logits += weight * behavior_logits
+            expert_idx += 1
         
-        # 3. 计算与所有物品文本嵌入的相似度 (保持不变)
-        all_text_embeddings = self.text_embedding.weight.transpose(0, 1)
-        content_logits = torch.matmul(content_query, all_text_embeddings)
+        # 2. 内容专家（基于文本嵌入）
+        if self.expert_config["experts"]["content_expert"]:
+            content_config = self.expert_config["content_expert"]
+            
+            if content_config.get("use_cross_attention", True):
+                # 使用交叉注意力机制
+                content_context_vector, _ = self.content_expert_attention(
+                    query=hidden_state,
+                    key=encoder_output,
+                    value=encoder_output,
+                    key_padding_mask=memory_padding_mask
+                )
+                content_query = self.content_attention_projection(content_context_vector)
+            else:
+                # 使用简单线性投影
+                content_query = self.content_expert_fc(hidden_state)
+            
+            # 计算与所有文本嵌入的相似度
+            all_text_embeddings = self.text_embedding.weight.transpose(0, 1)
+            content_logits = torch.matmul(content_query, all_text_embeddings)
+            
+            weight = gate_weights[:, :, expert_idx].unsqueeze(-1)  # (B, T, 1)
+            final_logits += weight * content_logits
+            expert_idx += 1
         
-        # --- 门控网络与专家融合 (保持不变) ---
-        gate_weights = self.gate_network(hidden_state)
-        w_behavior = gate_weights[:, :, 0].unsqueeze(-1)
-        w_content = gate_weights[:, :, 1].unsqueeze(-1)
-        
-        final_logits = w_behavior * behavior_logits + w_content * content_logits
+        # 3. 图像专家（基于书封面嵌入）【预留实现】
+        if self.expert_config["experts"]["image_expert"]:
+            image_config = self.expert_config["image_expert"]
+            
+            if image_config.get("use_cross_attention", True):
+                # 使用交叉注意力机制
+                image_context_vector, _ = self.image_expert_attention(
+                    query=hidden_state,
+                    key=encoder_output,
+                    value=encoder_output,
+                    key_padding_mask=memory_padding_mask
+                )
+                image_query = self.image_attention_projection(image_context_vector)
+            else:
+                # 使用简单线性投影
+                image_query = self.image_expert_fc(hidden_state)
+            
+            # 计算与所有图像嵌入的相似度
+            all_image_embeddings = self.image_embedding.weight.transpose(0, 1)
+            image_logits = torch.matmul(image_query, all_image_embeddings)
+            
+            weight = gate_weights[:, :, expert_idx].unsqueeze(-1)  # (B, T, 1)
+            final_logits += weight * image_logits
+            expert_idx += 1
         
         if return_weights:
             return final_logits, gate_weights

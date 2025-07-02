@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader, Dataset
 from src.config import get_config
 from src.GeniusRec import GENIUSRecModel
 from src.dataset import Seq2SeqRecDataset
-# Make sure you import HSTU and GenerativeDecoder
+
 from src.encoder.encoder import Hstu
 from src.decoder.decoder import GenerativeDecoder
 
@@ -107,9 +107,6 @@ def compute_ranking_metrics(user_embeddings, all_item_embeddings, target_item_id
     return hr_list, ndcg_list
 
 def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, epoch, num_epochs, pad_token_id):
-    """
-    训练一个epoch
-    """
     model.train()
     total_loss = 0.0
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Training]")
@@ -124,6 +121,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
         
         logits = model(source_ids, decoder_input_ids, source_padding_mask, return_weights=False)
 
+        # 修正：使用传统的CrossEntropyLoss调用方式
         loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
         
         loss.backward()
@@ -137,21 +135,19 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
     avg_loss = total_loss / len(dataloader)
     return avg_loss
 
-def evaluate_model(model, val_loader, eval_loader, criterion, device, epoch, num_epochs, 
-                   pad_token_id, item_num, top_k=10):
+def evaluate_model_validation(model, val_loader, criterion, device, epoch, num_epochs, pad_token_id):
     """
-    完整的模型评估函数：计算loss/ppl和排序指标
-    每个epoch都会计算所有指标，确保能及时发现性能变化
+    验证集评估：只计算loss和ppl，用于早停和模型选择
     """
     model.eval()
     
-    # === 第一部分：验证集上的loss和ppl评估 ===
-    total_loss = 0.0
+    total_loss_tokens = 0.0
+    total_tokens = 0
     total_behavior_weight = 0.0
     total_content_weight = 0.0
     total_valid_batches = 0
 
-    progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Validation Loss/PPL]")
+    progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Validation]")
 
     with torch.no_grad():
         for batch in progress_bar:
@@ -162,8 +158,12 @@ def evaluate_model(model, val_loader, eval_loader, criterion, device, epoch, num
 
             logits, gate_weights = model(source_ids, decoder_input_ids, source_padding_mask, return_weights=True)
             
+            # 修正：使用传统的CrossEntropyLoss调用方式
             loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
-            total_loss += loss.item()
+            
+            valid_tokens = (labels.view(-1) != pad_token_id).sum().item()
+            total_loss_tokens += loss.item() * valid_tokens
+            total_tokens += valid_tokens
 
             non_padding_mask = (decoder_input_ids != pad_token_id)
             behavior_weights = gate_weights[:, :, 0][non_padding_mask]
@@ -176,20 +176,31 @@ def evaluate_model(model, val_loader, eval_loader, criterion, device, epoch, num
 
             progress_bar.set_postfix(loss=loss.item())
 
-    avg_loss = total_loss / len(val_loader)
+    avg_loss = total_loss_tokens / total_tokens if total_tokens > 0 else 0
     perplexity = math.exp(avg_loss) if avg_loss < 20 else float('inf')
     avg_behavior_w = total_behavior_weight / total_valid_batches if total_valid_batches > 0 else 0
     avg_content_w = total_content_weight / total_valid_batches if total_valid_batches > 0 else 0
     
-    # === 第二部分：排序指标评估 ===
+    return {
+        'val_loss': avg_loss,
+        'val_ppl': perplexity,
+        'avg_behavior_weight': avg_behavior_w,
+        'avg_content_weight': avg_content_w
+    }
+
+def evaluate_model_test(model, test_loader, device, item_num, top_k=10):
+    """
+    测试集评估：只计算排序指标，训练结束后调用一次
+    """
+    model.eval()
     all_hr_scores, all_ndcg_scores = [], []
     
     with torch.no_grad():
-        # 创建所有物品的嵌入矩阵
+        # 预先计算所有物品嵌入，避免重复计算
         all_item_ids = torch.arange(1, item_num, device=device)
         all_item_embeddings = model.encoder.item_embedding(all_item_ids)
         
-        progress_bar = tqdm(eval_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Ranking Metrics]")
+        progress_bar = tqdm(test_loader, desc="Test Set Evaluation")
         
         for batch in progress_bar:
             input_ids = batch['input_ids'].to(device)
@@ -213,12 +224,8 @@ def evaluate_model(model, val_loader, eval_loader, criterion, device, epoch, num
     avg_ndcg = np.mean(all_ndcg_scores) if all_ndcg_scores else 0.0
     
     return {
-        'val_loss': avg_loss,
-        'val_ppl': perplexity,
-        'avg_behavior_weight': avg_behavior_w,
-        'avg_content_weight': avg_content_w,
-        'hr': avg_hr,
-        'ndcg': avg_ndcg,
+        'test_hr': avg_hr,
+        'test_ndcg': avg_ndcg,
         'evaluated_samples': len(all_hr_scores)
     }
 
@@ -261,11 +268,8 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device):
             return {
                 'epoch': checkpoint.get('epoch', 0),
                 'best_val_loss': checkpoint.get('best_val_loss', float('inf')),
-                'best_ndcg': checkpoint.get('best_ndcg', 0.0),
                 'val_loss': checkpoint.get('val_loss', float('inf')),
                 'val_ppl': checkpoint.get('val_ppl', float('inf')),
-                'hr': checkpoint.get('hr', 0.0),
-                'ndcg': checkpoint.get('ndcg', 0.0),
                 'patience_counter': checkpoint.get('patience_counter', 0)
             }
             
@@ -285,11 +289,8 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device):
             return {
                 'epoch': 0,
                 'best_val_loss': float('inf'),
-                'best_ndcg': 0.0,
                 'val_loss': float('inf'),
                 'val_ppl': float('inf'),
-                'hr': 0.0,
-                'ndcg': 0.0,
                 'patience_counter': 0
             }
             
@@ -350,21 +351,21 @@ def main():
     logging.info(f"Device: {device}")
     logging.info(f"Arguments: {args}")
 
-    # 4. 数据加载
+    # 4. 数据加载 - 修正：使用独立的测试集
     logging.info("Loading data from processed directory...")
     with open(config['data']['id_maps_file'], 'rb') as f:
         id_maps = pickle.load(f)
 
     train_dataset = Seq2SeqRecDataset(config['data']['train_file'], config['decoder_model']['max_seq_len'])
     val_dataset = Seq2SeqRecDataset(config['data']['validation_file'], config['decoder_model']['max_seq_len'])
-    eval_dataset = ValidationDataset(
-        config['data']['validation_file'], 
+    test_dataset = ValidationDataset(
+        config['data']['test_file'],  # 修正：使用独立的测试集
         config['encoder_model']['max_len']
     )
     
     train_loader = DataLoader(train_dataset, batch_size=config['finetune']['batch_size'], shuffle=True, num_workers=config['finetune']['num_workers'])
     val_loader = DataLoader(val_dataset, batch_size=config['finetune']['batch_size'], shuffle=False, num_workers=config['finetune']['num_workers'])
-    eval_loader = DataLoader(eval_dataset, batch_size=config['finetune']['batch_size'], shuffle=False, num_workers=config['finetune']['num_workers'])
+    test_loader = DataLoader(test_dataset, batch_size=config['finetune']['batch_size'], shuffle=False, num_workers=config['finetune']['num_workers'])
     
     num_items = id_maps['num_items'] + 1
     pad_token_id = config['pad_token_id']
@@ -373,7 +374,7 @@ def main():
     logging.info(f"📊 Dataset Info:")
     logging.info(f"  - Training samples: {len(train_dataset)}")
     logging.info(f"  - Validation samples: {len(val_dataset)}")
-    logging.info(f"  - Evaluation samples: {len(eval_dataset)}")
+    logging.info(f"  - Test samples: {len(test_dataset)}")  # 修正：显示测试集样本数
     logging.info(f"  - Total items: {num_items}")
 
     # 5. 文本嵌入加载
@@ -407,20 +408,12 @@ def main():
     model = GENIUSRecModel(config['encoder_model'], config['decoder_model']).to(device)
     logging.info("GENIUS-Rec model created.")
 
-    # 7. 预训练权重加载（如果指定）
+    # 7. 预训练权重加载（如果指定）- 修正：移除跨平台hack
     if args.encoder_weights_path:
         try:
             logging.info(f"Loading encoder weights from: {args.encoder_weights_path}")
             
-            # 跨平台路径处理
-            if platform.system() == "Linux" and os.path.exists(args.encoder_weights_path):
-                temp_windows_path = getattr(pathlib, 'WindowsPath', None)
-                pathlib.WindowsPath = pathlib.PosixPath
-            
             checkpoint = torch.load(args.encoder_weights_path, map_location=device, weights_only=False)
-            
-            if platform.system() == "Linux" and 'temp_windows_path' in locals():
-                pathlib.WindowsPath = temp_windows_path
             
             # 处理不同的checkpoint格式
             if 'model_state_dict' in checkpoint:
@@ -475,7 +468,10 @@ def main():
         lr=config['finetune']['learning_rate']['decoder_lr'],
         weight_decay=config['finetune'].get('weight_decay', 0.01)
     )
-    criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id, label_smoothing=0.1)
+
+
+    # 标签平滑
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id, label_smoothing=config['finetune'].get('label_smoothing', 0))
 
     # 10. 学习率调度器
     num_training_steps = len(train_loader) * config['finetune']['num_epochs']
@@ -495,14 +491,12 @@ def main():
         output_dir = config['data']['checkpoint_dir']
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    best_model_path = output_dir / 'genius_rec_moe_best.pth'
-    best_ranking_model_path = output_dir / 'genius_rec_moe_best_ranking.pth'
-    latest_model_path = output_dir / 'genius_rec_moe_latest.pth'
+    best_model_path = output_dir / 'genius_rec_best.pth'  # 修正：只保存一个最佳模型
+    latest_model_path = output_dir / 'genius_rec_latest.pth'
 
     # 12. 断点续传
     start_epoch = 0
     best_val_loss = float('inf')
-    best_ndcg = 0.0
     patience_counter = 0
     
     resume_path = args.resume_from or latest_model_path
@@ -511,11 +505,9 @@ def main():
         if resume_info:
             start_epoch = resume_info['epoch'] + 1
             best_val_loss = resume_info['best_val_loss']
-            best_ndcg = resume_info['best_ndcg']
             patience_counter = resume_info['patience_counter']
             logging.info(f"✅ 成功恢复训练状态! 从 Epoch {start_epoch} 继续")
             logging.info(f"   - Best Val Loss: {best_val_loss:.4f}")
-            logging.info(f"   - Best NDCG: {best_ndcg:.4f}")
 
     # 13. 训练主循环
     logging.info("=== Starting Training Loop ===")
@@ -527,11 +519,10 @@ def main():
             device, epoch, config['finetune']['num_epochs'], pad_token_id
         )
         
-        # 每个epoch都进行完整评估
-        eval_results = evaluate_model(
-            model, val_loader, eval_loader, criterion, device, 
-            epoch, config['finetune']['num_epochs'], pad_token_id, 
-            num_items, top_k
+        # 验证集评估（只计算loss和ppl）
+        eval_results = evaluate_model_validation(
+            model, val_loader, criterion, device, 
+            epoch, config['finetune']['num_epochs'], pad_token_id
         )
         
         # 日志输出
@@ -541,14 +532,10 @@ def main():
         logging.info(f"  📊 Val PPL: {eval_results['val_ppl']:.4f}")
         logging.info(f"  ⚖️  Behavior Weight: {eval_results['avg_behavior_weight']:.4f}")
         logging.info(f"  ⚖️  Content Weight: {eval_results['avg_content_weight']:.4f}")
-        logging.info(f"  🎯 HR@{top_k}: {eval_results['hr']:.4f}")
-        logging.info(f"  🎯 NDCG@{top_k}: {eval_results['ndcg']:.4f}")
-        logging.info(f"  📊 Evaluated samples: {eval_results['evaluated_samples']}")
 
         # 准备保存的指标
         save_metrics = {
             'best_val_loss': best_val_loss,
-            'best_ndcg': best_ndcg,
             'patience_counter': patience_counter,
             **eval_results
         }
@@ -560,7 +547,7 @@ def main():
         )
         logging.info(f"保存最新检查点到: {latest_model_path}")
 
-        # 基于验证loss保存最佳模型
+        # 修正：只基于验证loss保存最佳模型
         if eval_results['val_loss'] < best_val_loss:
             best_val_loss = eval_results['val_loss']
             patience_counter = 0
@@ -570,20 +557,9 @@ def main():
                 best_model_path, model, optimizer, scheduler, 
                 epoch, save_metrics, config, num_items
             )
-            logging.info(f"🎉 发现新的最佳模型 (by loss)! Val Loss: {best_val_loss:.4f}")
+            logging.info(f"🎉 发现新的最佳模型! Val Loss: {best_val_loss:.4f}")
         else:
             patience_counter += 1
-            
-        # 基于NDCG保存最佳模型
-        if eval_results['ndcg'] > best_ndcg:
-            best_ndcg = eval_results['ndcg']
-            save_metrics['best_ndcg'] = best_ndcg
-            
-            save_checkpoint(
-                best_ranking_model_path, model, optimizer, scheduler, 
-                epoch, save_metrics, config, num_items
-            )
-            logging.info(f"🌟 发现新的最佳模型 (by NDCG)! NDCG: {best_ndcg:.4f}")
 
         # 早停检查
         early_stopping_patience = config['finetune'].get('early_stopping_patience', 10)
@@ -594,17 +570,31 @@ def main():
         logging.info(f"耐心计数: {patience_counter}/{early_stopping_patience}")
         logging.info("-" * 80)
 
-    # 14. 训练完成总结
+    # 14. 训练完成，在测试集上进行最终评估
     completed_epochs = epoch + 1 if 'epoch' in locals() else start_epoch
     logging.info("=== Training Finished ===")
     logging.info(f"训练总轮次: {completed_epochs}/{config['finetune']['num_epochs']}")
-    logging.info(f"📈 Final Results:")
-    logging.info(f"  - Best validation loss: {best_val_loss:.4f}")
-    logging.info(f"  - Best NDCG@{top_k}: {best_ndcg:.4f}")
+    logging.info(f"最佳验证损失: {best_val_loss:.4f}")
+    
+    # 15. 加载最佳模型并在测试集上评估
+    logging.info("=== Final Test Evaluation ===")
+    if os.path.exists(best_model_path):
+        checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        logging.info("已加载最佳模型进行测试集评估")
+        
+        test_results = evaluate_model_test(model, test_loader, device, num_items, top_k)
+        
+        logging.info(f"📈 Final Test Results:")
+        logging.info(f"  🎯 Test HR@{top_k}: {test_results['test_hr']:.4f}")
+        logging.info(f"  🎯 Test NDCG@{top_k}: {test_results['test_ndcg']:.4f}")
+        logging.info(f"  📊 Test samples: {test_results['evaluated_samples']}")
+    else:
+        logging.warning("未找到最佳模型文件，跳过测试集评估")
+    
     logging.info(f"检查点保存位置:")
     logging.info(f"  - Latest: {latest_model_path}")
-    logging.info(f"  - Best (Loss): {best_model_path}")
-    logging.info(f"  - Best (Ranking): {best_ranking_model_path}")
+    logging.info(f"  - Best: {best_model_path}")
 
 if __name__ == '__main__':
     main()

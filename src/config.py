@@ -82,6 +82,7 @@ def get_config():
                 "decoder_lr": 1e-3, # 解码器使用较大的学习率
                 "encoder_lr": 5e-6, # 编码器使用更小的学习率
             },
+            "label_smoothing": 0, # 标签平滑，防止过拟合
             "warmup_steps": 1000, # 学习率预热步数
             "weight_decay": 0.1,
             "early_stopping_patience": 5,

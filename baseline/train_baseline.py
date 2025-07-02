@@ -14,6 +14,7 @@ import numpy as np
 # 使用主项目的配置和数据集
 from src.config import get_config
 from src.encoder.dataset4encoder import RecDataset 
+from baseline.model import BaselineTransformer 
 
 def set_seed(seed):
     """设置随机种子以确保结果可复现"""
@@ -116,6 +117,9 @@ class SampledSoftmaxLoss(nn.Module):
         pos_embeddings = norm_item_embeddings[valid_targets]  # [N_valid, D]
         pos_logits = (valid_output * pos_embeddings).sum(dim=1, keepdim=True)  # [N_valid, 1]
         
+        # 确保logits在合理范围内
+        pos_logits = torch.clamp(pos_logits, min=-10.0, max=10.0)
+        
         # 负采样
         neg_indices = torch.randint(1, num_items + 1,  # 避免采样到pad_token(0)
                                    (valid_output.size(0), self.num_negatives),
@@ -131,8 +135,14 @@ class SampledSoftmaxLoss(nn.Module):
         neg_logits = torch.bmm(valid_output.unsqueeze(1), 
                               neg_embeddings.transpose(1, 2)).squeeze(1)  # [N_valid, num_neg]
         
+        # 确保logits在合理范围内
+        neg_logits = torch.clamp(neg_logits, min=-10.0, max=10.0)
+        
         # 合并正负样本logits，应用温度
         all_logits = torch.cat([pos_logits, neg_logits], dim=1) / self.temperature  # [N_valid, 1+num_neg]
+        
+        # 再次确保logits稳定
+        all_logits = torch.clamp(all_logits, min=-20.0, max=20.0)
         
         # 标签（正样本在位置0）
         labels = torch.zeros(valid_output.size(0), dtype=torch.long, 
@@ -144,95 +154,7 @@ class SampledSoftmaxLoss(nn.Module):
         
         return weighted_loss
 
-class BaselineTransformer(nn.Module):
-    """
-    简单的Transformer baseline模型，用作与HSTU对比的基准
-    """
-    def __init__(self, item_num, embedding_dim, max_len, num_layers, num_heads, dropout, pad_token_id):
-        super().__init__()
-        self.item_num = item_num
-        self.embedding_dim = embedding_dim
-        self.max_len = max_len
-        self.pad_token_id = pad_token_id
-        
-        # 物品嵌入层
-        self.item_embedding = nn.Embedding(item_num + 1, embedding_dim, padding_idx=pad_token_id)
-        
-        # 位置嵌入
-        self.position_embedding = nn.Embedding(max_len, embedding_dim)
-        
-        # Transformer编码器
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embedding_dim,
-            nhead=num_heads,
-            dim_feedforward=embedding_dim * 4,
-            dropout=dropout,
-            activation='relu',
-            batch_first=True,
-            norm_first=False
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        # Dropout和LayerNorm
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(embedding_dim)
-        
-        # 初始化权重
-        self.init_weights()
-    
-    def init_weights(self):
-        """初始化模型权重"""
-        for module in self.modules():
-            if isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, mean=0, std=0.02)
-            elif isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0, std=0.02)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-    
-    def _generate_square_subsequent_mask(self, sz, device):
-        """生成一个上三角矩阵的mask，用于阻止看到未来的token"""
-        mask = (torch.triu(torch.ones(sz, sz, device=device)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-        return mask
 
-    def forward(self, input_ids):
-        """
-        前向传播
-        Args:
-            input_ids: [B, L] 输入序列
-        Returns:
-            sequence_output: [B, L, D] 序列输出
-        """
-        batch_size, seq_len = input_ids.size()
-        device = input_ids.device # 获取设备
-
-        # 物品嵌入
-        item_emb = self.item_embedding(input_ids)  # [B, L, D]
-        
-        # 位置嵌入
-        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, seq_len)
-        position_emb = self.position_embedding(position_ids)  # [B, L, D]
-        
-        # 输入嵌入 = 物品嵌入 + 位置嵌入
-        embeddings = item_emb + position_emb
-        embeddings = self.dropout(embeddings)
-        embeddings = self.layer_norm(embeddings)
-        
-        # 创建 padding mask (padding位置为True)
-        padding_mask = (input_ids == self.pad_token_id)  # [B, L]
-
-        # 【新增】创建 causal mask
-        causal_mask = self._generate_square_subsequent_mask(seq_len, device) # [L, L]
-        
-        # 【修改】将 causal_mask 传入 Transformer 编码器
-        sequence_output = self.transformer_encoder(
-            embeddings, 
-            mask=causal_mask, 
-            src_key_padding_mask=padding_mask
-        )
-        
-        return sequence_output
 
 def train():
     config = get_config()
@@ -263,24 +185,36 @@ def train():
     test_loader = DataLoader(test_dataset, batch_size=config['pretrain']['batch_size'], shuffle=False, num_workers=config['pretrain']['num_workers'])
     logging.info(f"数据集加载完成. 物品总数: {item_num}")
 
-    # 模型实例化 - Baseline Transformer
+    # 模型实例化 - Baseline Transformer，使用与HSTU完全相同的超参数
     model = BaselineTransformer(
         item_num=item_num,
-        embedding_dim=config['encoder_model']['embedding_dim'],
-        max_len=config['encoder_model']['max_len'],
-        num_layers=config['encoder_model']['num_layers'],
-        num_heads=config['encoder_model']['num_heads'],
-        dropout=config['encoder_model']['dropout'],
-        pad_token_id=config['pad_token_id']
+        embedding_dim=config['encoder_model']['embedding_dim'],  # 64
+        max_len=config['encoder_model']['max_len'],              # 50
+        num_layers=config['encoder_model']['num_layers'],        # 4
+        num_heads=config['encoder_model']['num_heads'],          # 4
+        dropout=config['encoder_model']['dropout'],              # 0.1
+        pad_token_id=config['pad_token_id']                      # 0
     ).to(device)
 
-    # 使用与HSTU相同的优化器设置
+    logging.info(f"Baseline模型参数: embedding_dim={config['encoder_model']['embedding_dim']}, "
+                f"num_layers={config['encoder_model']['num_layers']}, "
+                f"num_heads={config['encoder_model']['num_heads']}")
+
+    # 计算模型参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logging.info(f"Baseline模型总参数量: {total_params:,}, 可训练参数: {trainable_params:,}")
+
+    # 使用与HSTU相同但更保守的优化器设置
     optimizer = torch.optim.AdamW(
         model.parameters(), 
-        lr=config['pretrain']['learning_rate'], 
+        lr=config['pretrain']['learning_rate'] * 0.1,  # 减小学习率10倍防止梯度爆炸
         weight_decay=config['pretrain']['weight_decay'],
-        betas=(0.9, 0.98)  # 与HSTU保持一致
+        betas=(0.9, 0.98),  # 与HSTU保持一致
+        eps=1e-8  # 增加数值稳定性
     )
+    
+    logging.info(f"优化器设置: lr={config['pretrain']['learning_rate'] * 0.1}, weight_decay={config['pretrain']['weight_decay']}")
     
     # 使用与HSTU相同的Sampled Softmax损失
     criterion = SampledSoftmaxLoss(
@@ -293,6 +227,61 @@ def train():
     best_ndcg = 0.0
     patience_counter = 0
     logging.info("--- 开始Baseline训练 (对齐HSTU训练流程) ---")
+    
+    # 添加一个简单的梯度检查
+    logging.info("执行初始梯度检查...")
+    model.train()
+    sample_batch = next(iter(train_loader))
+    input_ids, target_ids = sample_batch[0][:2].to(device), sample_batch[1][:2].to(device)
+    
+    logging.info(f"样本输入形状: {input_ids.shape}, 目标形状: {target_ids.shape}")
+    logging.info(f"输入ID范围: [{input_ids.min().item()}, {input_ids.max().item()}]")
+    logging.info(f"目标ID范围: [{target_ids.min().item()}, {target_ids.max().item()}]")
+    
+    # 检查模型输出
+    sequence_output = model(input_ids)
+    logging.info(f"模型输出形状: {sequence_output.shape}")
+    logging.info(f"输出范围: [{sequence_output.min().item():.4f}, {sequence_output.max().item():.4f}]")
+    logging.info(f"输出是否包含NaN: {torch.isnan(sequence_output).any().item()}")
+    
+    # 检查嵌入权重
+    embed_weights = model.item_embedding.weight
+    logging.info(f"嵌入权重形状: {embed_weights.shape}")
+    logging.info(f"嵌入权重范围: [{embed_weights.min().item():.4f}, {embed_weights.max().item():.4f}]")
+    logging.info(f"嵌入权重是否包含NaN: {torch.isnan(embed_weights).any().item()}")
+    
+    supervision_weights = (target_ids != config['pad_token_id']).float()
+    logging.info(f"监督权重形状: {supervision_weights.shape}")
+    logging.info(f"有效位置数量: {supervision_weights.sum().item()}")
+    
+    try:
+        test_loss = criterion(sequence_output, target_ids, model.item_embedding.weight, supervision_weights)
+        logging.info(f"初始测试损失: {test_loss.item():.4f}")
+    except Exception as e:
+        logging.error(f"损失计算出错: {e}")
+        logging.error(f"sequence_output形状: {sequence_output.shape}")
+        logging.error(f"target_ids形状: {target_ids.shape}")
+        logging.error(f"embed_weights形状: {model.item_embedding.weight.shape}")
+        logging.error(f"supervision_weights形状: {supervision_weights.shape}")
+        return
+    if torch.isnan(test_loss) or torch.isinf(test_loss):
+        logging.error("初始损失就是NaN/Inf! 请检查模型和数据！")
+        return
+    
+    # 检查初始梯度
+    test_loss.backward()
+    max_grad = 0.0
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad_norm = param.grad.norm().item()
+            max_grad = max(max_grad, grad_norm)
+    
+    logging.info(f"初始最大梯度范数: {max_grad:.4f}")
+    if max_grad > 100:
+        logging.warning(f"初始梯度过大: {max_grad:.4f}, 建议进一步调整学习率或初始化")
+    
+    # 清空梯度开始正式训练
+    model.zero_grad()
 
     for epoch in range(config['pretrain']['num_epochs']):
         logging.info(f"--- Epoch {epoch+1}/{config['pretrain']['num_epochs']} ---")
@@ -320,8 +309,26 @@ def train():
             loss = criterion(output_embeddings, supervision_ids, 
                         model.item_embedding.weight, supervision_weights)
             
+            # 检查损失是否为NaN
+            if torch.isnan(loss) or torch.isinf(loss):
+                logging.error(f"训练过程中发现NaN/Inf损失! Batch {len(train_bar)}, Loss: {loss.item()}")
+                # 跳过这个batch
+                continue
+            
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            # 检查梯度是否过大
+            max_grad = 0.0
+            for param in model.parameters():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    max_grad = max(max_grad, grad_norm)
+            
+            if max_grad > 10.0:  # 如果梯度过大，记录警告
+                logging.warning(f"梯度过大: {max_grad:.4f}")
+            
+            # 更强的梯度裁剪防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # 从1.0减小到0.5
             optimizer.step()
             
             total_loss += loss.item()

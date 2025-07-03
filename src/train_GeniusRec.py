@@ -25,7 +25,10 @@ from src.encoder.encoder import Hstu
 from src.decoder.decoder import GenerativeDecoder
 
 
-# # 从头开始训练
+# # 端到端微调训练（推荐方式）
+# python -m src.train_GeniusRec --encoder_weights_path checkpoints/hstu_encoder.pth
+
+# # 冻结编码器训练（对比实验）
 # python -m src.train_GeniusRec --encoder_weights_path checkpoints/hstu_encoder.pth --freeze_encoder
 
 # # 从检查点恢复训练
@@ -128,8 +131,8 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
     model.train()
     total_loss = 0.0
     
-    # 初始化用于在进度条上显示的权重信息
-    weights_postfix = {'Bhv W': 0.0, 'Cnt W': 0.0}
+    # 🔧 修复：动态初始化权重显示，基于实际启用的专家
+    weights_postfix = {}
 
     # 使用tqdm来实时显示loss和权重
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Training]", leave=True)
@@ -168,13 +171,23 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
         
         # --- 实时更新进度条后缀 ---
         if gate_weights is not None:
-            # 取一个batch的平均权重来观察
-            # 假设第一个专家是Behavior, 第二个是Content
-            weights_postfix['Bhv W'] = gate_weights[:, :, 0].mean().item()
-            if gate_weights.shape[-1] > 1:
-                 weights_postfix['Cnt W'] = gate_weights[:, :, 1].mean().item()
-            else:
-                 weights_postfix['Cnt W'] = 0.0 # 如果只有一个专家
+            # 🔧 修复：动态显示启用的专家权重
+            enabled_experts = [k for k, v in model.decoder.expert_config["experts"].items() if v]
+            weights_postfix = {}  # 重置权重显示
+            
+            for i, expert_name in enumerate(enabled_experts):
+                if i < gate_weights.shape[-1]:
+                    # 创建简化的专家名称用于显示
+                    if expert_name == 'behavior_expert':
+                        display_name = 'Bhv W'
+                    elif expert_name == 'content_expert':
+                        display_name = 'Cnt W'
+                    elif expert_name == 'image_expert':
+                        display_name = 'Img W'
+                    else:
+                        display_name = f'{expert_name[:3].title()} W'
+                    
+                    weights_postfix[display_name] = f"{gate_weights[:, :, i].mean().item():.3f}"
 
         # 更新进度条的显示信息，合并loss和权重
         current_postfix = {'loss': f"{loss.item():.4f}", **weights_postfix}
@@ -388,6 +401,7 @@ def main():
     # 【新增】专家系统控制参数
     parser.add_argument('--disable_behavior_expert', action='store_true', help='Disable behavior expert.')
     parser.add_argument('--disable_content_expert', action='store_true', help='Disable content expert.')
+    parser.add_argument('--disable_image_expert', action='store_true', help='Disable image expert.')
     parser.add_argument('--enable_image_expert', action='store_true', help='Enable image expert (requires image embeddings).')
     parser.add_argument('--image_embeddings_path', type=str, default=None, help='Path to image embeddings file.')
     
@@ -400,6 +414,8 @@ def main():
         config['expert_system']['experts']['behavior_expert'] = False
     if args.disable_content_expert:
         config['expert_system']['experts']['content_expert'] = False
+    if args.disable_image_expert:
+        config['expert_system']['experts']['image_expert'] = False
     if args.enable_image_expert:
         config['expert_system']['experts']['image_expert'] = True
     

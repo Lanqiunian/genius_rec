@@ -86,8 +86,11 @@ python -m src.encoder.train_encoder
 *此步骤是项目的核心，用于训练完整的生成式推荐模型。*
 
 ```bash
-# 指定预训练好的编码器权重路径，冻结编码器参数，并开始训练解码器
-python -m src.train_GeniusRec --encoder_weights_path checkpoints/hstu_official_aligned_best.pth --freeze_encoder
+# 指定预训练好的编码器权重路径，开始端到端微调训练
+python -m src.train_GeniusRec --encoder_weights_path checkpoints/hstu_encoder.pth
+
+# 或者如果需要冻结编码器参数进行对比实验
+python -m src.train_GeniusRec --encoder_weights_path checkpoints/hstu_encoder.pth --freeze_encoder
 ```
 
 ## 未来规划

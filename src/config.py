@@ -31,6 +31,7 @@ def get_config():
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "seed": 42,
         "pad_token_id": 0,
+        "sos_token_id": 1,  # 🔧 新增：明确定义SOS token
         
         # =================================================================
         # 2. 模型超参数配置 (Model Hyperparameters)
@@ -131,13 +132,6 @@ def get_config():
                 "image_encoder": "clip",     # 图像编码器类型
                 "use_adaptive_pooling": True, # 使用自适应池化适配不同维度
                 "visual_attention_dropout": 0.1, # 视觉注意力dropout
-            },
-            
-            # 专家融合策略
-            "fusion_strategy": {
-                "method": "weighted_sum",    # 融合方法：'weighted_sum', 'attention_fusion'
-                "normalize_weights": True,   # 是否归一化专家权重
-                "expert_dropout": 0.1,       # 专家dropout率
             }
         }
     }

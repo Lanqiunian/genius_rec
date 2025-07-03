@@ -1,5 +1,6 @@
 # src/GeniusRec.py
 
+import torch
 import torch.nn as nn
 # 确保导入正确的类
 from src.encoder.encoder import Hstu      
@@ -10,20 +11,32 @@ class GENIUSRecModel(nn.Module):
         super().__init__()
         self.encoder = Hstu(**encoder_config)
         
-        # 将专家配置传递给解码器 (这部分逻辑保持不变)
+        # 将专家配置传递给解码器
         decoder_config_with_expert = decoder_config.copy()
         if expert_config:
             decoder_config_with_expert['expert_config'] = expert_config
             
         self.decoder = GenerativeDecoder(**decoder_config_with_expert)
+        
+        # 🔧 修复：添加维度匹配检查和投影层
+        encoder_dim = encoder_config['embedding_dim']
+        decoder_dim = decoder_config['embedding_dim']
+        
+        if encoder_dim != decoder_dim:
+            print(f"⚠️  编码器维度({encoder_dim}) != 解码器维度({decoder_dim})，添加投影层")
+            self.encoder_projection = nn.Linear(encoder_dim, decoder_dim)
+        else:
+            self.encoder_projection = None
 
-    # ==================== ✨ 关键修正 ✨ ====================
-    # 在 forward 方法签名中添加 force_equal_weights 参数
     def forward(self, source_ids, target_ids, source_padding_mask, 
                 force_equal_weights: bool = False, 
                 return_weights: bool = False):
         
         encoder_output = self.encoder(source_ids)
+        
+        # 🔧 修复：处理维度不匹配
+        if self.encoder_projection is not None:
+            encoder_output = self.encoder_projection(encoder_output)
         
         # 将参数一路传递给解码器
         return self.decoder(

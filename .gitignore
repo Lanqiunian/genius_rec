@@ -9,4 +9,3 @@ checkpoints/
 __pycache__/
 *.log
 *.ckpt
-data_enhancer.py

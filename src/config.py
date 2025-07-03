@@ -106,7 +106,7 @@ def get_config():
             "experts": {
                 "behavior_expert": True,     # 行为专家（基于用户序列行为）
                 "content_expert": True,      # 内容专家（基于文本嵌入）
-                "image_expert": False,       # 图像专家（基于书封面，预留）
+                "image_expert": True,        # 图像专家（基于书封面）🎨 启用视觉专家！
             },
             
             # 门控网络配置
@@ -123,12 +123,14 @@ def get_config():
                 "text_embedding_dim": 768,   # 文本嵌入维度
             },
             
-            # 图像专家配置（预留）
+            # 图像专家配置
             "image_expert": {
                 "attention_heads": 4,        # 交叉注意力头数  
                 "use_cross_attention": True, # 是否使用交叉注意力
-                "image_embedding_dim": 512,  # 图像嵌入维度（可根据实际调整）
+                "image_embedding_dim": 512,  # 图像嵌入维度（CLIP ViT-B/32）
                 "image_encoder": "clip",     # 图像编码器类型
+                "use_adaptive_pooling": True, # 使用自适应池化适配不同维度
+                "visual_attention_dropout": 0.1, # 视觉注意力dropout
             },
             
             # 专家融合策略

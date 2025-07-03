@@ -33,7 +33,8 @@ python generate_image_embeddings.py \
     --model_type clip \
     --input_dir "$IMAGE_DIR" \
     --output_file data/book_image_embeddings.npy \
-    --id_maps_file data/processed/id_maps.pkl
+    --batch_size 32 \
+    --use_item_id_keys
 
 # 检查生成结果
 if [ -f "data/book_image_embeddings.npy" ]; then

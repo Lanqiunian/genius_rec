@@ -561,30 +561,61 @@ def main():
     # 8. 文本嵌入加载到模型
     model.decoder.load_text_embeddings(text_embedding_matrix.to(device))
     
-    # 【新增】图像嵌入加载（如果启用图像专家）
+    # 【新增】智能图像嵌入加载系统 🎨
     if config['expert_system']['experts']['image_expert']:
-        if args.image_embeddings_path and os.path.exists(args.image_embeddings_path):
-            logging.info(f"Loading image embeddings from: {args.image_embeddings_path}")
+        image_embeddings_path = args.image_embeddings_path or "data/book_image_embeddings.npy"
+        
+        if os.path.exists(image_embeddings_path):
+            logging.info(f"🎨 Loading visual expert embeddings from: {image_embeddings_path}")
             try:
-                image_embeddings_dict = np.load(args.image_embeddings_path, allow_pickle=True).item()
-                image_embedding_dim = next(iter(image_embeddings_dict.values())).shape[0]
-                image_embedding_matrix = torch.zeros(num_items, image_embedding_dim, dtype=torch.float)
+                # 加载图像嵌入字典
+                image_embeddings_dict = np.load(image_embeddings_path, allow_pickle=True).item()
                 
-                loaded_image_count = 0
-                for asin, embedding in image_embeddings_dict.items():
-                    if asin in item_asin_map:
-                        item_id = item_asin_map[asin]
-                        image_embedding_matrix[item_id] = torch.tensor(embedding, dtype=torch.float)
-                        loaded_image_count += 1
-                
-                model.decoder.load_image_embeddings(image_embedding_matrix.to(device))
-                logging.info(f"Successfully loaded and mapped {loaded_image_count} image embeddings.")
+                if isinstance(image_embeddings_dict, dict) and len(image_embeddings_dict) > 0:
+                    # 获取嵌入维度
+                    sample_embedding = next(iter(image_embeddings_dict.values()))
+                    image_embedding_dim = sample_embedding.shape[0]
+                    logging.info(f"📐 Image embedding dimension: {image_embedding_dim}")
+                    
+                    # 更新配置中的图像嵌入维度
+                    config['expert_system']['image_expert']['image_embedding_dim'] = image_embedding_dim
+                    
+                    # 初始化图像嵌入矩阵 (使用小的随机值初始化未匹配的项目)
+                    image_embedding_matrix = torch.randn(num_items, image_embedding_dim, dtype=torch.float) * 0.01
+                    
+                    # 映射item_id并加载嵌入 - 现在统一使用item_id作为键
+                    loaded_image_count = 0
+                    
+                    for item_id, embedding in image_embeddings_dict.items():
+                        # 所有键现在都是item_id (整数)
+                        if isinstance(item_id, (int, np.int32, np.int64)) and 0 <= item_id < num_items:
+                            image_embedding_matrix[item_id] = torch.tensor(embedding, dtype=torch.float)
+                            loaded_image_count += 1
+                    
+                    # 加载到模型
+                    model.decoder.load_image_embeddings(image_embedding_matrix.to(device))
+                    
+                    # 统计信息
+                    coverage_rate = (loaded_image_count / num_items) * 100
+                    logging.info(f"✅ Visual Expert Integration Complete!")
+                    logging.info(f"   📊 Loaded {loaded_image_count:,} image embeddings (item_id keys)")
+                    logging.info(f"   📈 Coverage: {coverage_rate:.1f}% of {num_items:,} items")
+                    
+                    if coverage_rate < 50:
+                        logging.warning(f"⚠️  Low image coverage ({coverage_rate:.1f}%). Consider generating more image embeddings.")
+                    
+                else:
+                    raise ValueError("Empty or invalid image embeddings dictionary")
+                    
             except Exception as e:
-                logging.error(f"Failed to load image embeddings: {e}")
-                logging.info("Disabling image expert...")
+                logging.error(f"❌ Failed to load image embeddings: {e}")
+                logging.info("🔄 Gracefully disabling visual expert...")
                 config['expert_system']['experts']['image_expert'] = False
         else:
-            logging.warning("Image expert enabled but no image embeddings path provided. Disabling image expert...")
+            logging.warning(f"📁 Image embeddings file not found: {image_embeddings_path}")
+            logging.info("💡 To enable visual expert, generate image embeddings first:")
+            logging.info(f"   python generate_image_embeddings.py --input_dir data/book_covers_enhanced --output_file {image_embeddings_path}")
+            logging.info("🔄 Disabling visual expert for this run...")
             config['expert_system']['experts']['image_expert'] = False
 
     # 9. 优化器和损失函数

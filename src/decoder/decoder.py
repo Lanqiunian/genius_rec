@@ -126,7 +126,7 @@ class GenerativeDecoder(nn.Module):
                 # 简单线性投影方案
                 self.content_expert_fc = nn.Linear(embedding_dim, content_config["text_embedding_dim"])
         
-        # 3. 图像专家 (Image Expert) - 基于书封面嵌入 【预留】
+        # 3. 图像专家 (Image Expert) - 基于书封面嵌入 🎨
         if self.expert_config["experts"]["image_expert"]:
             image_config = self.expert_config["image_expert"]
             self.image_embedding = nn.Embedding(num_items, image_config["image_embedding_dim"], padding_idx=pad_token_id)
@@ -136,7 +136,7 @@ class GenerativeDecoder(nn.Module):
                 self.image_expert_attention = nn.MultiheadAttention(
                     embed_dim=embedding_dim,
                     num_heads=image_config["attention_heads"],
-                    dropout=dropout_ratio,
+                    dropout=image_config.get("visual_attention_dropout", 0.1),
                     batch_first=True
                 )
                 self.image_attention_projection = nn.Linear(embedding_dim, image_config["image_embedding_dim"])
@@ -266,28 +266,34 @@ class GenerativeDecoder(nn.Module):
             final_logits += weight * content_logits
             expert_idx += 1
         
-        # 3. 图像专家（基于书封面嵌入）【预留实现】
+        # 3. 图像专家（基于书封面嵌入）🎨 与文本专家对称设计
         if self.expert_config["experts"]["image_expert"]:
             image_config = self.expert_config["image_expert"]
             
             if image_config.get("use_cross_attention", True):
-                # 使用交叉注意力机制
-                image_context_vector, _ = self.image_expert_attention(
+                # 使用交叉注意力机制 - 与文本专家相同的设计模式
+                visual_context_vector, _ = self.image_expert_attention(
                     query=hidden_state,
                     key=encoder_output,
                     value=encoder_output,
                     key_padding_mask=memory_padding_mask
                 )
-                image_query = self.image_attention_projection(image_context_vector)
+                visual_query = self.image_attention_projection(visual_context_vector)
             else:
                 # 使用简单线性投影
-                image_query = self.image_expert_fc(hidden_state)
+                visual_query = self.image_expert_fc(hidden_state)
             
             # 计算与所有图像嵌入的相似度
             all_image_embeddings = self.image_embedding.weight.transpose(0, 1)
-            image_logits = torch.matmul(image_query, all_image_embeddings)
+            image_logits = torch.matmul(visual_query, all_image_embeddings)
             
-            weight = gate_weights[:, :, expert_idx].unsqueeze(-1)  # (B, T, 1)
+            if force_equal_weights:
+                # 预热模式：分配均等权重
+                weight = 1.0 / num_enabled_experts
+            else:
+                # 正常模式：使用门控网络的权重
+                weight = gate_weights[:, :, expert_idx].unsqueeze(-1)  # (B, T, 1)
+                
             final_logits += weight * image_logits
             expert_idx += 1
         

@@ -197,7 +197,10 @@ class GenerativeDecoder(nn.Module):
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-    def forward(self, target_ids: torch.Tensor, encoder_output: torch.Tensor, memory_padding_mask: torch.Tensor, return_weights: bool = False):
+    def forward(self, target_ids: torch.Tensor, encoder_output: torch.Tensor, memory_padding_mask: torch.Tensor, 
+                force_equal_weights: bool = False, # 【新增】外部控制标志
+                return_weights: bool = False):
+        
         batch_size, target_len = target_ids.size()
         positions = torch.arange(0, target_len, device=target_ids.device).unsqueeze(0)
         target_emb = self.item_embedding(target_ids) * math.sqrt(self.embedding_dim)
@@ -210,18 +213,30 @@ class GenerativeDecoder(nn.Module):
         for layer in self.decoder_layers:
             hidden_state = layer(hidden_state, encoder_output, target_mask, memory_padding_mask)
         
-        # ==================== 动态专家系统推理（显存优化版）====================
-        # 计算门控权重
-        gate_weights = self.gate_network(hidden_state)  # (B, T, num_experts)
+        # ==================== ✨ 动态专家系统 + 预热模式 ✨ ====================
         
         # 【显存优化】初始化结果tensor，逐个专家计算并累加
         final_logits = torch.zeros(batch_size, target_len, self.num_items, device=target_ids.device)
-        expert_idx = 0
         
+        # 如果需要，提前计算门控权重
+        gate_weights = None
+        if not force_equal_weights:
+            gate_weights = self.gate_network(hidden_state)  # (B, T, num_experts)
+            
+        expert_idx = 0
+        num_enabled_experts = len(self.enabled_experts)
+
         # 1. 行为专家
         if self.expert_config["experts"]["behavior_expert"]:
             behavior_logits = self.behavior_expert_fc(hidden_state)
-            weight = gate_weights[:, :, expert_idx].unsqueeze(-1)  # (B, T, 1)
+            
+            if force_equal_weights:
+                # 预热模式：分配均等权重
+                weight = 1.0 / num_enabled_experts
+            else:
+                # 正常模式：使用门控网络的权重
+                weight = gate_weights[:, :, expert_idx].unsqueeze(-1)  # (B, T, 1)
+
             final_logits += weight * behavior_logits
             expert_idx += 1
         
@@ -229,24 +244,25 @@ class GenerativeDecoder(nn.Module):
         if self.expert_config["experts"]["content_expert"]:
             content_config = self.expert_config["content_expert"]
             
+            # (这部分逻辑保持不变)
             if content_config.get("use_cross_attention", True):
-                # 使用交叉注意力机制
                 content_context_vector, _ = self.content_expert_attention(
-                    query=hidden_state,
-                    key=encoder_output,
-                    value=encoder_output,
-                    key_padding_mask=memory_padding_mask
+                    query=hidden_state, key=encoder_output, value=encoder_output, key_padding_mask=memory_padding_mask
                 )
                 content_query = self.content_attention_projection(content_context_vector)
             else:
-                # 使用简单线性投影
                 content_query = self.content_expert_fc(hidden_state)
             
-            # 计算与所有文本嵌入的相似度
             all_text_embeddings = self.text_embedding.weight.transpose(0, 1)
             content_logits = torch.matmul(content_query, all_text_embeddings)
             
-            weight = gate_weights[:, :, expert_idx].unsqueeze(-1)  # (B, T, 1)
+            if force_equal_weights:
+                # 预热模式：分配均等权重
+                weight = 1.0 / num_enabled_experts
+            else:
+                # 正常模式：使用门控网络的权重
+                weight = gate_weights[:, :, expert_idx].unsqueeze(-1)  # (B, T, 1)
+                
             final_logits += weight * content_logits
             expert_idx += 1
         
@@ -276,6 +292,11 @@ class GenerativeDecoder(nn.Module):
             expert_idx += 1
         
         if return_weights:
+            # 如果是预热模式，gate_weights为None，我们可以返回一个模拟的权重用于监控
+            if force_equal_weights:
+                 # 创建一个形状正确的虚拟权重张量
+                 simulated_weights = torch.full((batch_size, target_len, num_enabled_experts), 1.0 / num_enabled_experts, device=hidden_state.device)
+                 return final_logits, simulated_weights
             return final_logits, gate_weights
         else:
             return final_logits

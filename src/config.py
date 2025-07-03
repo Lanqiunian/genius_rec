@@ -88,6 +88,7 @@ def get_config():
             "early_stopping_patience": 5,
             "num_workers": 10,
             "split_ratio": 0.5, # 数据集分割比例
+            "warmup_epochs": 3, # 预热轮次
         },
         
         # =================================================================

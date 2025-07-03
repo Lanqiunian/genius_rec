@@ -106,10 +106,33 @@ def compute_ranking_metrics(user_embeddings, all_item_embeddings, target_item_id
     
     return hr_list, ndcg_list
 
-def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, epoch, num_epochs, pad_token_id):
+def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, epoch, num_epochs, pad_token_id, force_equal_weights=False):
+    """
+    训练一个epoch，并实时监控损失和专家权重。
+
+    Args:
+        model: 待训练的模型。
+        dataloader: 训练数据加载器。
+        criterion: 损失函数。
+        optimizer: 优化器。
+        scheduler: 学习率调度器。
+        device: 'cuda' 或 'cpu'。
+        epoch (int): 当前的epoch数。
+        num_epochs (int): 总的epoch数。
+        pad_token_id (int): 用于padding的token ID。
+        force_equal_weights (bool): 是否强制专家使用均等权重（用于预热）。
+
+    Returns:
+        float: 该epoch的平均训练损失。
+    """
     model.train()
     total_loss = 0.0
-    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Training]")
+    
+    # 初始化用于在进度条上显示的权重信息
+    weights_postfix = {'Bhv W': 0.0, 'Cnt W': 0.0}
+
+    # 使用tqdm来实时显示loss和权重
+    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Training]", leave=True)
 
     for batch_idx, batch in enumerate(progress_bar):
         source_ids = batch['source_ids'].to(device)
@@ -119,32 +142,51 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
 
         optimizer.zero_grad()
         
-        logits = model(source_ids, decoder_input_ids, source_padding_mask, return_weights=False)
+        # ==================== ✨ 核心修改 ✨ ====================
+        # 调用模型时，传入force_equal_weights并要求返回权重
+        logits, gate_weights = model(
+            source_ids, 
+            decoder_input_ids, 
+            source_padding_mask,
+            force_equal_weights=force_equal_weights, # 传入控制标志
+            return_weights=True                      # 要求返回权重以供监控
+        )
+        # =======================================================
 
-        # 修正：使用传统的CrossEntropyLoss调用方式
+        # 计算损失 (保持不变)
         loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        scheduler.step()
+        
+        # 仅在需要时更新学习率 (取决于您的scheduler类型)
+        if scheduler is not None:
+             scheduler.step()
         
         total_loss += loss.item()
         
-        # 显存监控（每100个batch显示一次）
-        if batch_idx % 100 == 0 and torch.cuda.is_available():
-            memory_allocated = torch.cuda.memory_allocated() / 1024**3
-            memory_reserved = torch.cuda.memory_reserved() / 1024**3
-            progress_bar.set_postfix(
-                loss=loss.item(), 
-                avg_loss=total_loss/(batch_idx+1),
-                gpu_mem=f"{memory_allocated:.1f}GB"
-            )
-        else:
-            progress_bar.set_postfix(loss=loss.item(), avg_loss=total_loss/(batch_idx+1))
+        # --- 实时更新进度条后缀 ---
+        if gate_weights is not None:
+            # 取一个batch的平均权重来观察
+            # 假设第一个专家是Behavior, 第二个是Content
+            weights_postfix['Bhv W'] = gate_weights[:, :, 0].mean().item()
+            if gate_weights.shape[-1] > 1:
+                 weights_postfix['Cnt W'] = gate_weights[:, :, 1].mean().item()
+            else:
+                 weights_postfix['Cnt W'] = 0.0 # 如果只有一个专家
+
+        # 更新进度条的显示信息，合并loss和权重
+        current_postfix = {'loss': f"{loss.item():.4f}", **weights_postfix}
+        progress_bar.set_postfix(current_postfix)
         
     avg_loss = total_loss / len(dataloader)
-    return avg_loss
+    
+    # 在每个epoch结束时，通过logging记录最终的平均loss
+    # (权重信息已经在进度条中实时显示了)
+    logging.info(f"Epoch {epoch+1} training finished. Average Loss: {avg_loss:.4f}")
+    
+    return avg_loss # <-- 保持返回值不变
 
 def evaluate_model_validation(model, val_loader, criterion, device, epoch, num_epochs, pad_token_id):
     """
@@ -594,12 +636,14 @@ def main():
 
     # 13. 训练主循环
     logging.info("=== Starting Training Loop ===")
-    
+    warmup_epochs = config['finetune'].get('warmup_epochs', 2)
     for epoch in range(start_epoch, config['finetune']['num_epochs']):
         # 训练一个epoch
+        is_warmup_phase = (epoch < warmup_epochs)
         avg_train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, scheduler, 
-            device, epoch, config['finetune']['num_epochs'], pad_token_id
+            device, epoch, config['finetune']['num_epochs'], pad_token_id,
+            force_equal_weights=is_warmup_phase
         )
         
         # 验证集评估（只计算loss和ppl）

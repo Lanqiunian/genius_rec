@@ -74,7 +74,23 @@ class GenerativeDecoder(nn.Module):
     def __init__(self, num_items: int, embedding_dim: int, num_layers: int, num_heads: int, 
                  ffn_hidden_dim: int, max_seq_len: int, dropout_ratio: float = 0.1, 
                  pad_token_id: int = 0, text_embedding_dim: int = 768, 
-                 expert_config: dict = None):  # 【新增】专家配置参数
+                 expert_config: dict = None, **kwargs):  # 【新增】专家配置参数
+        """
+        初始化生成式解码器
+        
+        Args:
+            num_items: 物品总数（包括特殊标记）
+            embedding_dim: 嵌入维度
+            num_layers: 解码器层数
+            num_heads: 多头注意力头数
+            ffn_hidden_dim: 前馈网络隐藏层维度
+            max_seq_len: 最大序列长度
+            dropout_ratio: dropout比例
+            pad_token_id: padding标记ID
+            text_embedding_dim: 文本嵌入维度
+            expert_config: 专家系统配置字典
+            **kwargs: 其他参数（向前兼容）
+        """
         super(GenerativeDecoder, self).__init__()
         
         # 基础组件
@@ -102,6 +118,10 @@ class GenerativeDecoder(nn.Module):
         self.enabled_experts = [k for k, v in self.expert_config["experts"].items() if v]
         num_experts = len(self.enabled_experts)
         
+        # 🔧 修复：确保至少启用一个专家
+        if num_experts == 0:
+            raise ValueError("❌ 至少需要启用一个专家！请检查expert_config配置。")
+        
         print(f"🧠 启用的专家: {self.enabled_experts} (共{num_experts}个)")
         
         # 1. 行为专家 (Behavior Expert)
@@ -125,6 +145,12 @@ class GenerativeDecoder(nn.Module):
             else:
                 # 简单线性投影方案
                 self.content_expert_fc = nn.Linear(embedding_dim, content_config["text_embedding_dim"])
+        else:
+            # 🔧 修复：专家被禁用时，将相关层设为None
+            self.text_embedding = None
+            self.content_expert_attention = None
+            self.content_attention_projection = None
+            self.content_expert_fc = None
         
         # 3. 图像专家 (Image Expert) - 基于书封面嵌入 🎨
         if self.expert_config["experts"]["image_expert"]:
@@ -142,6 +168,12 @@ class GenerativeDecoder(nn.Module):
                 self.image_attention_projection = nn.Linear(embedding_dim, image_config["image_embedding_dim"])
             else:
                 self.image_expert_fc = nn.Linear(embedding_dim, image_config["image_embedding_dim"])
+        else:
+            # 🔧 修复：专家被禁用时，将相关层设为None
+            self.image_embedding = None
+            self.image_expert_attention = None
+            self.image_attention_projection = None
+            self.image_expert_fc = None
 
         # 4. 动态门控网络
         gate_config = self.expert_config["gate_config"]
@@ -168,6 +200,11 @@ class GenerativeDecoder(nn.Module):
         if not self.expert_config["experts"]["content_expert"]:
             print("⚠️  内容专家未启用，跳过文本嵌入加载")
             return
+        
+        # 🔧 修复：检查text_embedding是否存在
+        if self.text_embedding is None:
+            print("❌ 内容专家相关层未初始化，无法加载文本嵌入")
+            return
             
         if self.text_embedding.weight.shape != embedding_matrix.shape:
             raise ValueError(f"文本嵌入形状不匹配! 模型期望 {self.text_embedding.weight.shape}, 但得到 {embedding_matrix.shape}")
@@ -182,6 +219,11 @@ class GenerativeDecoder(nn.Module):
         """
         if not self.expert_config["experts"]["image_expert"]:
             print("⚠️  图像专家未启用，跳过图像嵌入加载")
+            return
+        
+        # 🔧 修复：检查image_embedding是否存在
+        if self.image_embedding is None:
+            print("❌ 图像专家相关层未初始化，无法加载图像嵌入")
             return
             
         if self.image_embedding.weight.shape != embedding_matrix.shape:
@@ -250,12 +292,20 @@ class GenerativeDecoder(nn.Module):
         if self.expert_config["experts"]["content_expert"]:
             content_config = self.expert_config["content_expert"]
             
+            # 🔧 修复：确保相关层存在才进行计算
+            if self.text_embedding is None:
+                raise RuntimeError("内容专家已启用但相关层未初始化！")
+            
             if content_config.get("use_cross_attention", True):
+                if self.content_expert_attention is None or self.content_attention_projection is None:
+                    raise RuntimeError("内容专家交叉注意力层未初始化！")
                 content_context_vector, _ = self.content_expert_attention(
                     query=hidden_state, key=encoder_output, value=encoder_output, key_padding_mask=memory_padding_mask
                 )
                 content_query = self.content_attention_projection(content_context_vector)
             else:
+                if self.content_expert_fc is None:
+                    raise RuntimeError("内容专家线性层未初始化！")
                 content_query = self.content_expert_fc(hidden_state)
             
             all_text_embeddings = self.text_embedding.weight.transpose(0, 1)
@@ -274,7 +324,13 @@ class GenerativeDecoder(nn.Module):
         if self.expert_config["experts"]["image_expert"]:
             image_config = self.expert_config["image_expert"]
             
+            # 🔧 修复：确保相关层存在才进行计算
+            if self.image_embedding is None:
+                raise RuntimeError("图像专家已启用但相关层未初始化！")
+            
             if image_config.get("use_cross_attention", True):
+                if self.image_expert_attention is None or self.image_attention_projection is None:
+                    raise RuntimeError("图像专家交叉注意力层未初始化！")
                 # 使用交叉注意力机制 - 与文本专家相同的设计模式
                 visual_context_vector, _ = self.image_expert_attention(
                     query=hidden_state,
@@ -284,6 +340,8 @@ class GenerativeDecoder(nn.Module):
                 )
                 visual_query = self.image_attention_projection(visual_context_vector)
             else:
+                if self.image_expert_fc is None:
+                    raise RuntimeError("图像专家线性层未初始化！")
                 # 使用简单线性投影
                 visual_query = self.image_expert_fc(hidden_state)
             

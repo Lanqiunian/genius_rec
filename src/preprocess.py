@@ -76,9 +76,18 @@ def main():
     # --- 3. ID 重映射 (对齐官方) ---
     print("--- 3. 将user_id和item_id重映射为连续整数 ---")
     
-    # 【关键修正】重映射后的ID从1开始，为pad_token_id=0留出空间
-    ratings['user_id_remap'] = pd.Categorical(ratings['user_id']).codes + 1
-    ratings['item_id_remap'] = pd.Categorical(ratings['item_id']).codes + 1
+    # 获取特殊标记配置
+    pad_token_id = config['pad_token_id']
+    sos_token_id = config['sos_token_id'] 
+    eos_token_id = config['eos_token_id']
+    mask_token_id = config['mask_token_id']
+    
+    # 计算特殊标记的数量，为其预留ID空间
+    num_special_tokens = max(pad_token_id, sos_token_id, eos_token_id, mask_token_id) + 1
+    
+    # 【关键修正】重映射后的ID从num_special_tokens开始，为特殊标记留出空间
+    ratings['user_id_remap'] = pd.Categorical(ratings['user_id']).codes + num_special_tokens
+    ratings['item_id_remap'] = pd.Categorical(ratings['item_id']).codes + num_special_tokens
     
     # 【关键修正】保存新的映射关系
     user_map = {original: remap_id for original, remap_id in zip(ratings['user_id'], ratings['user_id_remap'])}
@@ -88,7 +97,14 @@ def main():
         'user_map': user_map,
         'item_map': item_map,
         'num_users': len(user_map),
-        'num_items': len(item_map)
+        'num_items': len(item_map),
+        'num_special_tokens': num_special_tokens,
+        'special_tokens': {
+            'pad_token_id': pad_token_id,
+            'sos_token_id': sos_token_id,
+            'eos_token_id': eos_token_id,
+            'mask_token_id': mask_token_id
+        }
     }
 
     print("--- 4. 按用户分组生成序列 (使用重映射后的ID) ---")

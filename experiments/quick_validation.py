@@ -80,17 +80,17 @@ class QuickExperimentRunner:
                     print(output.strip())  # 实时显示到终端
                     captured_output.append(output.strip())  # 同时捕获
                     
-                    # 关键信息也写入日志文件
+                    # 🔧 修复：只记录关键信息，避免进度条刷屏
                     if any(keyword in output for keyword in [
-                        "Epoch", "Starting Training", "开始训练", "训练完成", 
-                        "Best Val Loss", "HR@", "NDCG@", "实验", "loading", "加载"
+                        "Starting Training", "开始训练", "训练完成", "training finished",
+                        "Best Val Loss", "HR@", "NDCG@", "实验", "loading", "加载",
+                        "✅", "❌", "⚠️"
                     ]):
                         self.logger.info(f"[训练输出] {output.strip()}")
                         
-                    # 每10个epoch记录一次进度
-                    if "Epoch" in output and "/50" in output:
-                        epoch_info = output.strip()
-                        self.logger.info(f"[进度更新] {epoch_info}")
+                    # 🔧 修复：只记录每10个epoch的完整进度，避免每个batch都记录
+                    if "training finished" in output and "Average Loss" in output:
+                        self.logger.info(f"[Epoch完成] {output.strip()}")
             
             # 等待进程结束并获取返回码
             return_code = process.wait(timeout=max_time)

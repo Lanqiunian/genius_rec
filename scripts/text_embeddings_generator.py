@@ -15,7 +15,7 @@ import threading
 # ===================================================================
 
 # 【注意】建议使用环境变量来管理您的密钥以提高安全性。
-GOOGLE_API_KEY = os.getenv('YOUR_GOOGLE_API_KEY')
+GOOGLE_API_KEY = "AIzaSyDSR_G4ESL3CtkVcmxjUwT5QpS_wCvKO_c"
 
 # --- 模型和并发配置 ---
 EMBEDDING_MODEL = "models/text-embedding-004"
@@ -28,8 +28,10 @@ MAX_CHARS_PER_INPUT = 2000
 
 # --- 文件路径配置 ---
 INPUT_PARQUET_FILE = 'data/book_text_data.parquet'
-STREAMING_OUTPUT_FILE = 'data/book_gemini_embeddings_progress.jsonl'
-FINAL_NUMPY_FILE = 'data/book_gemini_embeddings_final.npy'
+MISSING_ASINS_FILE = 'missing_text_embeddings.txt'  # 缺失嵌入的ASIN列表
+EXISTING_EMBEDDINGS_FILE = 'data/book_gemini_embeddings_filtered_migrated.npy'  # 现有嵌入文件
+STREAMING_OUTPUT_FILE = 'data/missing_embeddings_progress.jsonl'  # 新生成嵌入的进度文件
+FINAL_NUMPY_FILE = 'data/book_gemini_embeddings_filtered_migrated.npy'  # 更新后的最终文件
 
 # ===================================================================
 # 2. 【核心优化】客户端速率限制器
@@ -107,6 +109,23 @@ def load_processed_asins(filepath):
     print(f"已加载 {len(processed_asins)} 条已处理的记录。")
     return processed_asins
 
+def load_missing_asins(filepath):
+    """从文本文件中加载缺失的ASIN列表。"""
+    if not os.path.exists(filepath):
+        print(f"警告: 未找到缺失ASIN文件 '{filepath}'")
+        return set()
+    
+    print(f"正在加载缺失的ASIN列表: '{filepath}'")
+    missing_asins = set()
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line in f:
+            asin = line.strip()
+            if asin:
+                missing_asins.add(asin)
+    
+    print(f"已加载 {len(missing_asins)} 个缺失的ASIN")
+    return missing_asins
+
 def process_batch(batch_data, rate_limiter):
     """
     处理单个批次的函数，会先从速率限制器获取令牌。
@@ -142,9 +161,9 @@ def main():
         print("\n程序因API预检失败而终止。")
         return
         
-    print("\n--- 开始执行主任务 ---")
+    print("\n--- 开始执行缺失嵌入补充任务 ---")
 
-    # --- 步骤 2: 加载数据和进度 ---
+    # --- 步骤 2: 加载数据和缺失ASIN列表 ---
     try:
         books_df = pd.read_parquet(INPUT_PARQUET_FILE)
         print(f"成功加载 {len(books_df)} 条书籍数据。")
@@ -152,16 +171,26 @@ def main():
         print(f"错误: 未找到 '{INPUT_PARQUET_FILE}'。请先运行数据增强脚本。")
         return
 
+    # 加载缺失的ASIN列表
+    missing_asins = load_missing_asins(MISSING_ASINS_FILE)
+    if not missing_asins:
+        print("没有缺失的ASIN需要处理。")
+        return
+
+    # 加载已处理的ASIN（从进度文件）
     processed_asins = load_processed_asins(STREAMING_OUTPUT_FILE)
     
-    # --- 步骤 3: 准备任务批次 ---
-    print("正在准备需要处理的任务...")
+    # --- 步骤 3: 准备任务批次（只处理缺失的ASIN） ---
+    print("正在准备需要处理的缺失ASIN任务...")
     books_df.dropna(subset=['full_text', 'asin'], inplace=True)
     books_df = books_df[books_df['full_text'].str.strip() != '']
-    tasks_df = books_df[~books_df['asin'].isin(processed_asins)]
+    
+    # 筛选出缺失的且未处理的ASIN
+    target_asins = missing_asins - processed_asins
+    tasks_df = books_df[books_df['asin'].isin(target_asins)]
     
     if tasks_df.empty:
-        print("所有记录均已处理完毕！")
+        print("所有缺失的ASIN均已处理完毕或无对应文本数据！")
     else:
         text_list = [text[:MAX_CHARS_PER_INPUT] for text in tasks_df['full_text']]
         asin_list = tasks_df['asin'].tolist()
@@ -172,17 +201,17 @@ def main():
             batch_asins = asin_list[i:i + BATCH_SIZE]
             batches.append((batch_asins, batch_texts))
             
-        print(f"共需处理 {len(text_list)} 条新记录，分为 {len(batches)} 个批次。")
+        print(f"共需处理 {len(text_list)} 条缺失记录，分为 {len(batches)} 个批次。")
 
         # --- 步骤 4: 初始化速率限制器并执行并发任务 ---
-        rate_limiter = RateLimiter(requests_per_minute=1400) # 设置为比150略低的安全值
+        rate_limiter = RateLimiter(requests_per_minute=140) # 设置为比150略低的安全值
         
         try:
             with open(STREAMING_OUTPUT_FILE, 'a', encoding='utf-8') as f:
                 with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as executor:
                     future_to_batch = {executor.submit(process_batch, batch, rate_limiter): batch for batch in batches}
                     
-                    progress = tqdm(as_completed(future_to_batch), total=len(batches), desc="并发处理批次")
+                    progress = tqdm(as_completed(future_to_batch), total=len(batches), desc="处理缺失嵌入批次")
                     for future in progress:
                         batch_asins, result = future.result()
                         if isinstance(result, list) and len(batch_asins) == len(result):
@@ -196,21 +225,43 @@ def main():
             # 确保无论如何都停止速率限制器的后台线程
             rate_limiter.stop()
 
-    # --- 步骤 5: 最终转换 ---
-    print("\n所有任务已完成。正在将最终结果转换为Numpy字典文件...")
+    # --- 步骤 5: 合并现有嵌入和新生成的嵌入 ---
+    print("\n正在合并现有嵌入和新生成的嵌入...")
     
-    final_embeddings = {}
-    with open(STREAMING_OUTPUT_FILE, 'r', encoding='utf-8') as f:
-        for line in f:
-            try:
-                record = json.loads(line)
-                final_embeddings[record['asin']] = np.array(record['embedding'])
-            except (json.JSONDecodeError, KeyError):
-                continue
+    # 加载现有嵌入
+    existing_embeddings = {}
+    if os.path.exists(EXISTING_EMBEDDINGS_FILE):
+        existing_embeddings = np.load(EXISTING_EMBEDDINGS_FILE, allow_pickle=True).item()
+        print(f"已加载 {len(existing_embeddings)} 个现有嵌入")
+    
+    # 加载新生成的嵌入
+    new_embeddings = {}
+    if os.path.exists(STREAMING_OUTPUT_FILE):
+        with open(STREAMING_OUTPUT_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                    new_embeddings[record['asin']] = np.array(record['embedding'])
+                except (json.JSONDecodeError, KeyError):
+                    continue
+        print(f"已加载 {len(new_embeddings)} 个新生成的嵌入")
 
+    # 合并嵌入（新生成的会覆盖现有的）
+    final_embeddings = existing_embeddings.copy()
+    final_embeddings.update(new_embeddings)
+
+    # 保存合并后的最终文件
     np.save(FINAL_NUMPY_FILE, final_embeddings)
-    print(f"\n✅ 处理完成！成功转换 {len(final_embeddings)} 个嵌入。")
-    print(f"最终的Numpy字典已保存至: '{FINAL_NUMPY_FILE}'")
+    print(f"\n✅ 嵌入补充完成！")
+    print(f"   - 现有嵌入: {len(existing_embeddings)}")
+    print(f"   - 新增嵌入: {len(new_embeddings)}")
+    print(f"   - 最终总数: {len(final_embeddings)}")
+    print(f"   - 已保存至: '{FINAL_NUMPY_FILE}'")
+
+    # 清理进度文件（可选）
+    if os.path.exists(STREAMING_OUTPUT_FILE):
+        os.remove(STREAMING_OUTPUT_FILE)
+        print(f"已清理临时进度文件: '{STREAMING_OUTPUT_FILE}'")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import random
 import math
 import pathlib
 import platform
+from pathlib import Path
 
 from tqdm import tqdm
 from transformers import get_linear_schedule_with_warmup
@@ -37,7 +38,6 @@ from src.decoder.decoder import GenerativeDecoder
 # # 自定义保存目录
 # python -m src.train_GeniusRec --save_dir my_checkpoints
 
-# --- 无数据泄露的评估数据集 ---
 class ValidationDataset(Dataset):
     """
     用于排序指标评估的数据集：
@@ -445,35 +445,49 @@ def main():
     logging.info(f"Device: {device}")
     logging.info(f"Arguments: {args}")
 
-    # 4. 数据加载 - 修正：使用独立的测试集
+    # 4. 数据加载和ID映射处理
     logging.info("Loading data from processed directory...")
     with open(config['data']['id_maps_file'], 'rb') as f:
         id_maps = pickle.load(f)
 
-    train_dataset = Seq2SeqRecDataset(config['data']['train_file'], config['decoder_model']['max_seq_len'])
-    val_dataset = Seq2SeqRecDataset(config['data']['validation_file'], config['decoder_model']['max_seq_len'])
+    # 动态计算总词汇表大小（物品数量 + 特殊标记数量）
+    num_special_tokens = id_maps.get('num_special_tokens', 4)  # 默认4个特殊标记
+    total_vocab_size = id_maps['num_items'] + num_special_tokens
+    
+    # 将动态计算的参数添加到配置中
+    config['encoder_model']['item_num'] = total_vocab_size
+    config['decoder_model']['num_items'] = total_vocab_size
+    
+    logging.info(f"📊 Vocabulary Info:")
+    logging.info(f"  - Number of items: {id_maps['num_items']}")
+    logging.info(f"  - Number of special tokens: {num_special_tokens}")
+    logging.info(f"  - Total vocabulary size: {total_vocab_size}")
+    logging.info(f"  - Special tokens: {id_maps.get('special_tokens', {})}")
+
+    # 使用新的配置系统初始化数据集
+    train_dataset = Seq2SeqRecDataset(config, config['data']['train_file'], config['finetune']['split_ratio'])
+    val_dataset = Seq2SeqRecDataset(config, config['data']['validation_file'], config['finetune']['split_ratio'])
     test_dataset = ValidationDataset(
-        config['data']['test_file'],  # 修正：使用独立的测试集
-        config['encoder_model']['max_len']
+        config['data']['test_file'],  # 使用独立的测试集
+        config['encoder_model']['max_len'],
+        config['pad_token_id']
     )
     
     train_loader = DataLoader(train_dataset, batch_size=config['finetune']['batch_size'], shuffle=True, num_workers=config['finetune']['num_workers'])
     val_loader = DataLoader(val_dataset, batch_size=config['finetune']['batch_size'], shuffle=False, num_workers=config['finetune']['num_workers'])
     test_loader = DataLoader(test_dataset, batch_size=config['finetune']['batch_size'], shuffle=False, num_workers=config['finetune']['num_workers'])
     
-    num_items = id_maps['num_items'] + 1
     pad_token_id = config['pad_token_id']
     top_k = config['evaluation']['top_k']
     
     logging.info(f"📊 Dataset Info:")
     logging.info(f"  - Training samples: {len(train_dataset)}")
     logging.info(f"  - Validation samples: {len(val_dataset)}")
-    logging.info(f"  - Test samples: {len(test_dataset)}")  # 修正：显示测试集样本数
-    logging.info(f"  - Total items: {num_items}")
+    logging.info(f"  - Test samples: {len(test_dataset)}")
 
     # 5. 文本嵌入加载
     logging.info("Loading pre-computed and filtered text embeddings...")
-    text_embedding_file = config['data']['data_dir'] / 'book_gemini_embeddings_filtered.npy'
+    text_embedding_file = config['data']['data_dir'] / 'book_gemini_embeddings_filtered_migrated.npy'
     try:
         text_embeddings_dict = np.load(text_embedding_file, allow_pickle=True).item()
     except FileNotFoundError:
@@ -481,7 +495,7 @@ def main():
         return
 
     text_embedding_dim = next(iter(text_embeddings_dict.values())).shape[0]
-    text_embedding_matrix = torch.zeros(num_items, text_embedding_dim, dtype=torch.float)
+    text_embedding_matrix = torch.zeros(total_vocab_size, text_embedding_dim, dtype=torch.float)
     
     item_asin_map = id_maps['item_map']
     loaded_count = 0
@@ -495,9 +509,7 @@ def main():
     if loaded_count == 0:
         logging.warning("No embeddings were mapped. The content expert will not function.")
 
-    # 6. 模型初始化
-    config['encoder_model']['item_num'] = num_items
-    config['decoder_model']['num_items'] = num_items
+    # 6. 模型初始化（使用配置字典）
     config['decoder_model']['text_embedding_dim'] = text_embedding_dim
     
     # 【新增】传递专家配置到模型
@@ -523,12 +535,22 @@ def main():
         logging.info(f"   - 总容量: {memory_total:.2f}GB")
         logging.info(f"   - 剩余可用: {memory_total - memory_reserved:.2f}GB")
     
-    # 7. 预训练权重加载（如果指定）- 修正：移除跨平台hack
+    # 7. 预训练权重加载（优先使用迁移后的权重）
     if args.encoder_weights_path:
         try:
-            logging.info(f"Loading encoder weights from: {args.encoder_weights_path}")
+            # 检查是否存在迁移后的权重文件
+            weights_path = Path(args.encoder_weights_path)
+            migrated_weights_path = weights_path.parent / f"{weights_path.stem}_migrated.pth"
             
-            checkpoint = torch.load(args.encoder_weights_path, map_location=device, weights_only=False)
+            if migrated_weights_path.exists():
+                logging.info(f"Found migrated weights, loading from: {migrated_weights_path}")
+                load_path = migrated_weights_path
+            else:
+                logging.info(f"Loading original encoder weights from: {weights_path}")
+                logging.warning("⚠️  使用原始权重可能导致维度不匹配，建议先运行权重迁移脚本")
+                load_path = weights_path
+            
+            checkpoint = torch.load(load_path, map_location=device, weights_only=False)
             
             # 处理不同的checkpoint格式
             if 'model_state_dict' in checkpoint:
@@ -579,7 +601,7 @@ def main():
     
     # 【新增】智能图像嵌入加载系统 🎨
     if config['expert_system']['experts']['image_expert']:
-        image_embeddings_path = args.image_embeddings_path or "data/book_image_embeddings.npy"
+        image_embeddings_path = args.image_embeddings_path or "data/book_image_embeddings_migrated.npy"
         
         if os.path.exists(image_embeddings_path):
             logging.info(f"🎨 Loading visual expert embeddings from: {image_embeddings_path}")
@@ -593,10 +615,56 @@ def main():
                     image_embedding_dim = sample_embedding.shape[0]
                     logging.info(f"📐 Image embedding dimension: {image_embedding_dim}")
                     
-                    # 更新配置中的图像嵌入维度
+                    # 🔧 修复：更新配置但不重新初始化整个模型
                     config['expert_system']['image_expert']['image_embedding_dim'] = image_embedding_dim
                     
-                    # 初始化图像嵌入矩阵 (使用小的随机值初始化未匹配的项目)
+                    # 检查模型的图像嵌入层维度是否匹配
+                    current_image_dim = model.decoder.image_embedding.weight.shape[1] if hasattr(model.decoder, 'image_embedding') else None
+                    
+                    if current_image_dim != image_embedding_dim:
+                        logging.warning(f"图像嵌入维度不匹配: 模型={current_image_dim}, 文件={image_embedding_dim}")
+                        logging.info("需要重新初始化模型以适配图像嵌入维度...")
+                        
+                        # 只有在维度不匹配时才重新初始化
+                        model = GENIUSRecModel(
+                            config['encoder_model'], 
+                            config['decoder_model'],
+                            config['expert_system']
+                        ).to(device)
+                        
+                        # 重新加载编码器权重
+                        if args.encoder_weights_path:
+                            try:
+                                logging.info("🔄 重新加载编码器权重...")
+                                checkpoint = torch.load(args.encoder_weights_path, map_location=device, weights_only=False)
+                                encoder_state_dict = checkpoint.get('model_state_dict', checkpoint)
+                                
+                                # 处理item_num不匹配
+                                current_item_embedding_size = model.encoder.item_embedding.weight.shape
+                                checkpoint_item_embedding_size = encoder_state_dict.get('item_embedding.weight', torch.empty(0)).shape
+                                
+                                if checkpoint_item_embedding_size != current_item_embedding_size:
+                                    if len(checkpoint_item_embedding_size) > 0:
+                                        old_embedding = encoder_state_dict['item_embedding.weight']
+                                        new_embedding = model.encoder.item_embedding.weight.data.clone()
+                                        min_items = min(old_embedding.shape[0], new_embedding.shape[0])
+                                        new_embedding[:min_items] = old_embedding[:min_items]
+                                        encoder_state_dict['item_embedding.weight'] = new_embedding
+                                
+                                model.encoder.load_state_dict(encoder_state_dict, strict=False)
+                                
+                                if args.freeze_encoder:
+                                    for param in model.encoder.parameters():
+                                        param.requires_grad = False
+                                        
+                                # 重新加载文本嵌入
+                                model.decoder.load_text_embeddings(text_embedding_matrix.to(device))
+                                
+                            except Exception as e:
+                                logging.error(f"重新加载编码器权重失败: {e}")
+                    
+                    # 初始化图像嵌入矩阵
+                    num_items = total_vocab_size  # 使用总词汇表大小
                     image_embedding_matrix = torch.randn(num_items, image_embedding_dim, dtype=torch.float) * 0.01
                     
                     # 映射item_id并加载嵌入 - 现在统一使用item_id作为键

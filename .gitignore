@@ -9,3 +9,4 @@ checkpoints/
 __pycache__/
 *.log
 *.ckpt
+*.pth

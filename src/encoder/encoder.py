@@ -145,11 +145,29 @@ class HstuBlock(nn.Module):
 
 class Hstu(nn.Module):
     """完全对齐官方的HSTU模型"""
-    def __init__(self, item_num, embedding_dim=128, linear_hidden_dim=128, attention_dim=64,
-                 num_heads=8, num_layers=4, max_len=50, dropout=0.1, pad_token_id=0):
+    def __init__(self, item_num=None, embedding_dim=128, linear_hidden_dim=128, attention_dim=64,
+                 num_heads=8, num_layers=4, max_len=50, dropout=0.1, pad_token_id=0, **kwargs):
+        """
+        初始化HSTU编码器
+        
+        Args:
+            item_num: 物品总数（包括特殊标记）
+            embedding_dim: 嵌入维度
+            linear_hidden_dim: 线性层隐藏维度
+            attention_dim: 注意力维度
+            num_heads: 多头注意力头数
+            num_layers: 编码器层数
+            max_len: 最大序列长度
+            dropout: dropout比例
+            pad_token_id: padding标记ID
+            **kwargs: 其他参数（向前兼容）
+        """
         super(Hstu, self).__init__()
         
-        self.item_embedding = nn.Embedding(item_num + 1, embedding_dim, padding_idx=pad_token_id)
+        if item_num is None:
+            raise ValueError("item_num is required for HSTU encoder")
+        
+        self.item_embedding = nn.Embedding(item_num, embedding_dim, padding_idx=pad_token_id)
         self.max_len = max_len
         self.pad_token_id = pad_token_id
         

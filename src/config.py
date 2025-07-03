@@ -4,10 +4,7 @@ import torch
 from pathlib import Path
 
 def get_config():
-    """
-    返回一个包含所有项目配置的字典。
-    此版本为支持Encoder-Decoder微调而重构。
-    """
+
     ROOT_DIR = Path(__file__).parent.parent 
     
     config = {
@@ -31,7 +28,9 @@ def get_config():
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "seed": 42,
         "pad_token_id": 0,
-        "sos_token_id": 1,  # 🔧 新增：明确定义SOS token
+        "sos_token_id": 1,
+        "eos_token_id": 2,
+        "mask_token_id": 3,
         
         # =================================================================
         # 2. 模型超参数配置 (Model Hyperparameters)

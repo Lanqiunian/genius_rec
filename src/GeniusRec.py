@@ -8,7 +8,17 @@ from src.decoder.decoder import GenerativeDecoder
 
 class GENIUSRecModel(nn.Module):
     def __init__(self, encoder_config, decoder_config, expert_config=None):
+        """
+        初始化GENIUS-Rec模型
+        
+        Args:
+            encoder_config: 编码器配置字典
+            decoder_config: 解码器配置字典
+            expert_config: 专家系统配置字典
+        """
         super().__init__()
+        
+        # 初始化编码器
         self.encoder = Hstu(**encoder_config)
         
         # 将专家配置传递给解码器

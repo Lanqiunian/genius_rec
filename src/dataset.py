@@ -6,13 +6,22 @@ from torch.utils.data import Dataset
 # --- 1. 数据集准备 (适配Seq2Seq任务) ---
 # 🔧 修复版本：避免数据泄露，正确构造序列分割
 class Seq2SeqRecDataset(Dataset):
-    def __init__(self, data_path, max_seq_len, pad_token_id=0, split_ratio=0.5, sos_token_id=1):
+    def __init__(self, config, data_path, split_ratio=0.5):
+        """
+        初始化数据集
+        
+        Args:
+            config: 配置字典，包含所有必要参数
+            data_path: 数据文件路径
+            split_ratio: 编码器/解码器序列分割比例
+        """
         self.data = pd.read_parquet(data_path)
-        self.max_seq_len = max_seq_len
-        self.pad_token_id = pad_token_id
-        self.sos_token_id = sos_token_id  # 明确的开始标记
+        self.max_seq_len = config['encoder_model']['max_len']
+        self.pad_token_id = config['pad_token_id']
+        self.sos_token_id = config['sos_token_id']
+        self.eos_token_id = config['eos_token_id']
         # 分割点，例如0.5表示一半历史用于编码，一半用于解码
-        self.split_point = int(max_seq_len * split_ratio)
+        self.split_point = int(self.max_seq_len * split_ratio)
 
     def __len__(self):
         return len(self.data)
@@ -43,7 +52,7 @@ class Seq2SeqRecDataset(Dataset):
             copy_len = min(len(source_seq), self.split_point)
             source_ids[-copy_len:] = source_seq[-copy_len:]  # 右对齐
 
-        # 🔧 修复：正确构造解码器输入和标签
+        # 【关键修正】正确构造解码器输入和标签，支持EOS标记
         decoder_input_len = self.max_seq_len - self.split_point
         
         # 解码器输入：[SOS, target_seq[:-1]]
@@ -53,11 +62,14 @@ class Seq2SeqRecDataset(Dataset):
             copy_len = min(len(target_seq), decoder_input_len - 1)
             decoder_input_ids[1:1+copy_len] = target_seq[:copy_len]
 
-        # 解码器标签：[target_seq, EOS/PAD]
+        # 解码器标签：[target_seq, EOS, PAD...]
         labels = np.full(decoder_input_len, self.pad_token_id, dtype=np.int64)
         if len(target_seq) > 0:
-            copy_len = min(len(target_seq), decoder_input_len)
+            copy_len = min(len(target_seq), decoder_input_len - 1)
             labels[:copy_len] = target_seq[:copy_len]
+            # 在序列结束位置添加EOS标记（如果有空间）
+            if copy_len < decoder_input_len:
+                labels[copy_len] = self.eos_token_id
         
         return {
             'source_ids': torch.tensor(source_ids, dtype=torch.long),

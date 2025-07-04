@@ -273,7 +273,7 @@ class GenerativeDecoder(nn.Module):
         num_enabled_experts = len(self.enabled_experts)
         
         if force_equal_weights:
-            # 预热模式：创建均等权重张量
+            # 预热模式：创建均等权重张量 - 注意：确保使用target_len而非source_len
             equal_weight = 1.0 / num_enabled_experts
             expert_weights = torch.full((batch_size, target_len, num_enabled_experts), 
                                       equal_weight, device=target_ids.device)
@@ -284,7 +284,8 @@ class GenerativeDecoder(nn.Module):
             gate_input = hidden_state.mean(dim=1) 
             # (B, D) -> (B, num_experts)
             gate_weights_single = self.gate_network(gate_input)
-            # (B, num_experts) -> (B, 1, num_experts) -> (B, T, num_experts)
+            # (B, num_experts) -> (B, 1, num_experts) -> (B, target_len, num_experts)
+            # 注意：这里明确使用target_len而非编码器的source_len
             expert_weights = gate_weights_single.unsqueeze(1).expand(-1, target_len, -1)
             
             # 确保权重和为1（防止数值不稳定）

@@ -127,7 +127,11 @@ def evaluate_model_validation_with_ranking(model, val_loader, criterion, device,
         all_item_ids = torch.arange(1, item_num, device=device)
         all_item_embeddings = model.encoder.item_embedding(all_item_ids)  # [num_items-1, embed_dim]
     
-    progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Validation - Full Eval]")
+    # 根据评估模式设置不同的进度条描述
+    if num_candidates is not None and num_candidates > 0:
+        progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Validation - Sampled Eval ({num_candidates} candidates)]")
+    else:
+        progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Validation - Full Eval]")
 
     with torch.no_grad():
         for batch in progress_bar:
@@ -151,14 +155,31 @@ def evaluate_model_validation_with_ranking(model, val_loader, criterion, device,
             
             # 记录专家权重
             if gate_weights is not None:
-                masked_gate_weights = gate_weights * (labels.unsqueeze(-1) != pad_token_id).float().unsqueeze(-1)
-                if masked_gate_weights.numel() > 0:
-                    if total_gate_weights is None:
-                        total_gate_weights = masked_gate_weights.mean(dim=0)
-                        total_valid_batches = 1
-                    else:
-                        total_gate_weights += masked_gate_weights.mean(dim=0)
-                        total_valid_batches += 1
+                # 🔧 修复：从原理上理解和处理门控权重
+                # gate_weights形状为 [batch_size, target_len, num_experts]
+                # labels形状为 [batch_size, target_len]
+                
+                # 1. 创建一个掩码，标识哪些位置是有效标签（非pad）
+                label_mask = (labels != pad_token_id).float().unsqueeze(-1)  # [B, T, 1]
+                
+                # 2. 应用掩码，只考虑有效位置的权重
+                valid_gate_weights = gate_weights * label_mask
+                
+                # 3. 对每个batch的有效位置取平均（避免切片操作）
+                batch_sum = valid_gate_weights.sum(dim=1)  # [B, num_experts]
+                batch_count = label_mask.sum(dim=1)  # [B, 1]
+                # 防止除零
+                batch_mean = batch_sum / (batch_count + 1e-8)  # [B, num_experts]
+                
+                # 4. 再对整个batch取平均得到最终权重
+                masked_gate_weights = batch_mean.mean(dim=0)  # [num_experts]
+                
+                if total_gate_weights is None:
+                    total_gate_weights = masked_gate_weights
+                    total_valid_batches = 1
+                else:
+                    total_gate_weights += masked_gate_weights
+                    total_valid_batches += 1
             
             # 全量评估排序指标计算
             # 对整个批次获取编码器输出
@@ -197,7 +218,7 @@ def evaluate_model_validation_with_ranking(model, val_loader, criterion, device,
                     # 随机选择num_candidates-1个负样本ID (排除0和目标ID)
                     candidate_ids = set(range(1, item_num))
                     candidate_ids.discard(target_id)  # 排除正样本
-                    neg_ids = random.sample(candidate_ids, min(num_candidates-1, len(candidate_ids)))
+                    neg_ids = random.sample(list(candidate_ids), min(num_candidates-1, len(candidate_ids)))
                     
                     # 合并正负样本
                     all_candidate_ids = [target_id] + neg_ids
@@ -303,7 +324,11 @@ def evaluate_model_test(model, test_loader, device, item_num, num_candidates=Non
         all_item_ids = torch.arange(1, item_num, device=device)
         all_item_embeddings = model.encoder.item_embedding(all_item_ids)
         
-        progress_bar = tqdm(test_loader, desc="Test Set Evaluation - Full Eval")
+        # 根据评估模式设置不同的进度条描述
+        if num_candidates is not None and num_candidates > 0:
+            progress_bar = tqdm(test_loader, desc=f"Test Set Evaluation - Sampled Eval ({num_candidates} candidates)")
+        else:
+            progress_bar = tqdm(test_loader, desc="Test Set Evaluation - Full Eval")
         
         for batch in progress_bar:
             input_ids = batch['input_ids'].to(device)
@@ -331,7 +356,7 @@ def evaluate_model_test(model, test_loader, device, item_num, num_candidates=Non
                     # 随机选择num_candidates-1个负样本ID (排除0和目标ID)
                     candidate_ids = set(range(1, item_num))
                     candidate_ids.discard(target_id)  # 排除正样本
-                    neg_ids = random.sample(candidate_ids, min(num_candidates-1, len(candidate_ids)))
+                    neg_ids = random.sample(list(candidate_ids), min(num_candidates-1, len(candidate_ids)))
                     
                     # 合并正负样本
                     all_candidate_ids = [target_id] + neg_ids

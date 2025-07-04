@@ -1,0 +1,20 @@
+2025-07-05 02:36:35,426 - INFO - 开始验证修改后的评估方法...
+2025-07-05 02:36:35,426 - INFO - 图像专家设置: 禁用
+2025-07-05 02:36:35,426 - INFO - 检查特殊标记处理逻辑...
+2025-07-05 02:36:35,452 - INFO - 验证目标ID=4: HR=0.0000, NDCG=0.0000
+2025-07-05 02:36:35,452 - INFO - 验证目标ID=5: HR=0.5000, NDCG=0.5000
+2025-07-05 02:36:35,452 - INFO - 验证目标ID=10: HR=0.5000, NDCG=0.1934
+2025-07-05 02:36:35,453 - INFO - 特殊标记处理逻辑验证完成
+2025-07-05 02:36:35,541 - INFO - 使用GPU: NVIDIA GeForce RTX 4090
+2025-07-05 02:36:36,087 - INFO - 词汇表大小: 506949 (物品: 506945, 特殊标记: 4)
+2025-07-05 02:36:36,088 - INFO - 加载文本嵌入...
+2025-07-05 02:36:43,916 - INFO - 成功加载并映射 506046 个文本嵌入
+2025-07-05 02:36:43,916 - INFO - 图像专家状态: 禁用 (原始设置: 启用)
+2025-07-05 02:36:44,995 - INFO - 图像专家已禁用，不需要加载图像嵌入
+2025-07-05 02:36:48,274 - ERROR - 加载检查点失败: Error(s) in loading state_dict for GENIUSRecModel:
+	Unexpected key(s) in state_dict: "decoder.image_embedding_matrix", "decoder.image_expert_attention.in_proj_weight", "decoder.image_expert_attention.in_proj_bias", "decoder.image_expert_attention.out_proj.weight", "decoder.image_expert_attention.out_proj.bias", "decoder.image_attention_projection.weight", "decoder.image_attention_projection.bias". 
+	size mismatch for decoder.gate_network.0.weight: copying a param with shape torch.Size([3, 64]) from checkpoint, the shape in current model is torch.Size([2, 64]).
+	size mismatch for decoder.gate_network.0.bias: copying a param with shape torch.Size([3]) from checkpoint, the shape in current model is torch.Size([2]).
+🧠 启用的专家: ['behavior_expert', 'content_expert'] (共2个)
+📄 正在加载预训练文本嵌入...
+✅ 文本嵌入加载成功

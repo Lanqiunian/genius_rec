@@ -167,6 +167,7 @@ class Hstu(nn.Module):
         if item_num is None:
             raise ValueError("item_num is required for HSTU encoder")
         
+        # 修复：嵌入层大小应为item_num (已经包含了4个特殊标记)，保持与传入参数一致
         self.item_embedding = nn.Embedding(item_num, embedding_dim, padding_idx=pad_token_id)
         self.max_len = max_len
         self.pad_token_id = pad_token_id

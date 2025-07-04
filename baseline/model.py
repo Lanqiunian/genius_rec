@@ -163,7 +163,8 @@ class BaselineTransformer(nn.Module):
         self.pad_token_id = pad_token_id
         
         # 物品嵌入层 - 使用与HSTU相同的初始化
-        self.item_embedding = nn.Embedding(item_num + 1, embedding_dim, padding_idx=pad_token_id)
+        # 修复：嵌入层大小应为item_num (已经包含了4个特殊标记)，不需要再+1
+        self.item_embedding = nn.Embedding(item_num, embedding_dim, padding_idx=pad_token_id)
         
         # 位置编码 - 使用正弦位置编码而不是学习位置编码
         self.positional_encoder = SinusoidalPositionalEncoder(embedding_dim, dropout, max_len)

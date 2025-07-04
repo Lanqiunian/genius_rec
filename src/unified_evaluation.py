@@ -127,11 +127,7 @@ def evaluate_model_validation_with_ranking(model, val_loader, criterion, device,
         all_item_ids = torch.arange(1, item_num, device=device)
         all_item_embeddings = model.encoder.item_embedding(all_item_ids)  # [num_items-1, embed_dim]
     
-    # 根据评估模式设置不同的进度条描述
-    if num_candidates is not None and num_candidates > 0:
-        progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Validation - Sampled Eval ({num_candidates} candidates)]")
-    else:
-        progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Validation - Full Eval]")
+    progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Validation - Full Eval]")
 
     with torch.no_grad():
         for batch in progress_bar:
@@ -276,8 +272,10 @@ def evaluate_model_validation_with_ranking(model, val_loader, criterion, device,
     avg_gate_weights = total_gate_weights / total_valid_batches if total_valid_batches > 0 else None
     
     # 排序指标 - 完全对齐HSTU计算方式
-    avg_hr = hr_total / total_samples if total_samples > 0 else 0.0
-    avg_ndcg = ndcg_total / total_samples if total_samples > 0 else 0.0
+    # 注意：hr和ndcg已经在compute_hr_ndcg_full中按batch_size归一化
+    # 这里不需要再除以total_samples，只需要累加即可
+    avg_hr = hr_total / len(val_loader) if len(val_loader) > 0 else 0.0
+    avg_ndcg = ndcg_total / len(val_loader) if len(val_loader) > 0 else 0.0
     
     result = {
         'val_loss': avg_loss,
@@ -324,11 +322,7 @@ def evaluate_model_test(model, test_loader, device, item_num, num_candidates=Non
         all_item_ids = torch.arange(1, item_num, device=device)
         all_item_embeddings = model.encoder.item_embedding(all_item_ids)
         
-        # 根据评估模式设置不同的进度条描述
-        if num_candidates is not None and num_candidates > 0:
-            progress_bar = tqdm(test_loader, desc=f"Test Set Evaluation - Sampled Eval ({num_candidates} candidates)")
-        else:
-            progress_bar = tqdm(test_loader, desc="Test Set Evaluation - Full Eval")
+        progress_bar = tqdm(test_loader, desc="Test Set Evaluation - Full Eval")
         
         for batch in progress_bar:
             input_ids = batch['input_ids'].to(device)
@@ -397,8 +391,9 @@ def evaluate_model_test(model, test_loader, device, item_num, num_candidates=Non
             ndcg_total += ndcg * batch_size
             total_samples += batch_size
     
-    avg_hr = hr_total / total_samples if total_samples > 0 else 0.0
-    avg_ndcg = ndcg_total / total_samples if total_samples > 0 else 0.0
+    # 与HSTU保持一致：使用批次数量作为分母
+    avg_hr = hr_total / len(test_loader) if len(test_loader) > 0 else 0.0
+    avg_ndcg = ndcg_total / len(test_loader) if len(test_loader) > 0 else 0.0
     
     return {
         'test_hr': avg_hr,

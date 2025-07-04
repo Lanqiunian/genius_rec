@@ -64,7 +64,9 @@ def get_metrics(batch_logits, batch_labels, k, pad_token_id=0):
 
 def compute_hr_ndcg_full(user_embeddings, all_item_embeddings, target_item_ids, k=10):
     """
-    全量评估：计算HR@K和NDCG@K（与HSTU完全一致的实现）
+    全量评估：计算HR@K和NDCG@K（与HSTU和baseline完全一致的实现）
+    
+    此函数的实现逻辑与HSTU和baseline完全一致，确保评估结果的准确性和可比性。
     
     Args:
         user_embeddings: 用户嵌入 [batch_size, embed_dim]
@@ -78,14 +80,14 @@ def compute_hr_ndcg_full(user_embeddings, all_item_embeddings, target_item_ids, 
     """
     batch_size = user_embeddings.size(0)
     
-    # L2归一化（对齐官方实现）
+    # L2归一化（对齐HSTU原始实现）
     user_embeddings = F.normalize(user_embeddings, p=2, dim=1)
     all_item_embeddings = F.normalize(all_item_embeddings, p=2, dim=1)
     
     # 计算用户与所有物品的相似度 [batch_size, num_items-1]
     scores = torch.matmul(user_embeddings, all_item_embeddings.t())
     
-    # 排序获取排名（降序）
+    # 完全排序获取排名（降序）- 与HSTU完全一致
     _, sorted_indices = torch.sort(scores, dim=1, descending=True)
     
     hr_count = 0
@@ -94,23 +96,25 @@ def compute_hr_ndcg_full(user_embeddings, all_item_embeddings, target_item_ids, 
     
     for i in range(batch_size):
         target_id = target_item_ids[i].item()
-        if target_id == 0:
+        if target_id == 0:  # 跳过无效样本
             continue
         valid_samples += 1
             
-        target_idx = target_id - 1  # ID到索引的转换
+        # 修复：由于物品ID从4开始，需要减去4，使下标从0开始
+        target_idx = target_id - 4  # ID到索引的转换
         target_rank_positions = (sorted_indices[i] == target_idx).nonzero(as_tuple=True)[0]
         
         if len(target_rank_positions) > 0:
-            rank = target_rank_positions[0].item() + 1
+            rank = target_rank_positions[0].item() + 1  # 排名从1开始
             
             if rank <= k:
                 hr_count += 1
                 ndcg_sum += 1.0 / np.log2(rank + 1)
     
-    # 注意：这里使用有效样本数而非总批次大小
-    hr = hr_count / valid_samples if valid_samples > 0 else 0
-    ndcg = ndcg_sum / valid_samples if valid_samples > 0 else 0
+    # 与HSTU保持一致：使用总批次大小而非有效样本数作为分母
+    # 这确保了与原始HSTU实现的完全一致性
+    hr = hr_count / batch_size  # 注意这里使用总批次大小
+    ndcg = ndcg_sum / batch_size  # 注意这里使用总批次大小
     
     return hr, ndcg
 
@@ -148,7 +152,7 @@ def compute_hr_ndcg_batch(user_embeddings, all_item_embeddings, target_item_ids,
         if target_id == 0: 
             continue
 
-        target_idx = target_id - 1  # ID到索引的转换
+        target_idx = target_id - 4  # ID到索引的转换
         target_rank_positions = (sorted_indices[i] == target_idx).nonzero(as_tuple=True)[0]
         
         hr, ndcg = 0.0, 0.0

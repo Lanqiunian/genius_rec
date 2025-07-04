@@ -59,7 +59,8 @@ def get_metrics_full_eval(user_embeddings, all_item_embeddings, target_item_ids,
             continue
             
         # 找到目标物品在排序中的位置
-        target_idx = target_id - 1
+        # 修复：由于物品ID从4开始，需要减去4，使下标从0开始
+        target_idx = target_id - 4
         sorted_items = sorted_indices[i]
         target_rank_positions = (sorted_items == target_idx).nonzero(as_tuple=True)[0]
         
@@ -93,7 +94,7 @@ class SampledSoftmaxLoss(nn.Module):
             supervision_weights: [B, L-1] 有效位置的权重
         """
         batch_size, seq_len_minus_1, embed_dim = output_embeddings.shape
-        num_items = all_item_embeddings.size(0) - 1  # 去掉pad_token
+        num_items = all_item_embeddings.size(0) - 4  # 去掉pad_token
         
         # 展平处理，只保留有效位置
         flat_output = output_embeddings.reshape(-1, embed_dim)  # [B*(L-1), D]
@@ -121,14 +122,15 @@ class SampledSoftmaxLoss(nn.Module):
         pos_logits = torch.clamp(pos_logits, min=-10.0, max=10.0)
         
         # 负采样
-        neg_indices = torch.randint(1, num_items + 1,  # 避免采样到pad_token(0)
+        # 修复：避开所有特殊标记(0,1,2,3)，从4开始采样
+        neg_indices = torch.randint(4, num_items + 4,
                                    (valid_output.size(0), self.num_negatives),
                                    device=output_embeddings.device)
         
         # 去除与正样本相同的负样本
         neg_mask = neg_indices != valid_targets.unsqueeze(1)
         neg_indices = torch.where(neg_mask, neg_indices, 
-                                 torch.randint(1, num_items + 1, neg_indices.shape, 
+                                 torch.randint(4, num_items + 4, neg_indices.shape, 
                                              device=neg_indices.device))
         
         neg_embeddings = norm_item_embeddings[neg_indices]  # [N_valid, num_neg, D]
@@ -187,7 +189,7 @@ def train():
 
     # 模型实例化 - Baseline Transformer，使用与HSTU完全相同的超参数
     model = BaselineTransformer(
-        item_num=item_num,
+        item_num + 4,
         embedding_dim=config['encoder_model']['embedding_dim'],  # 64
         max_len=config['encoder_model']['max_len'],              # 50
         num_layers=config['encoder_model']['num_layers'],        # 4
@@ -342,7 +344,8 @@ def train():
         total_hr, total_ndcg = 0.0, 0.0
         with torch.no_grad():
             # 获取所有物品的嵌入（用于全量评估）
-            all_item_ids = torch.arange(1, item_num + 1, device=device)  # 排除padding物品(0)
+            # 修复：使用从4开始的物品ID（跳过所有特殊标记0,1,2,3）
+            all_item_ids = torch.arange(4, item_num + 4, device=device)  # 排除所有特殊标记(0,1,2,3)
             all_item_embeddings = model.item_embedding(all_item_ids)  # [num_items, D]
             
             eval_bar = tqdm(val_loader, desc=f"全量评估 Epoch {epoch+1}")
@@ -389,7 +392,8 @@ def train():
         total_hr, total_ndcg = 0.0, 0.0
         with torch.no_grad():
             # 获取所有物品的嵌入
-            all_item_ids = torch.arange(1, item_num + 1, device=device)
+            # 修复：使用从4开始的物品ID（跳过所有特殊标记0,1,2,3）
+            all_item_ids = torch.arange(4, item_num + 4, device=device)
             all_item_embeddings = model.item_embedding(all_item_ids)
             
             test_bar = tqdm(test_loader, desc="测试中（全量评估）")

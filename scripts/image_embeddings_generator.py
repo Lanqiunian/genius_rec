@@ -1,8 +1,20 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-图像嵌入生成器 - 支持CLIP等多种视觉模型
-使用单卡4090高效生成图像嵌入，支持批处理和内存优化
+图像嵌入生成器 - 使用CLIP模型为书籍封面生成嵌入向量
+
+功能：
+1. 扫描book_covers_enhanced目录下的图像文件
+2. 使用预训练CLIP模型生成图像嵌入
+3. 支持批处理和GPU加速
+4. 生成book_image_embeddings.npy嵌入文件
+
+使用方法：
+1. 确保已安装依赖：pip install torch torchvision clip-by-openai pillow tqdm
+2. 准备图像文件到data/book_covers_enhanced/目录
+3. 运行：python scripts/image_embeddings_generator.py
+
+注意：需要GPU支持以获得最佳性能
 """
 
 import os
@@ -105,130 +117,113 @@ class ImageEmbeddingGenerator:
             batch_size=batch_size, 
             shuffle=False, 
             num_workers=num_workers,
-            pin_memory=True
+            pin_memory=True if self.device == 'cuda' else False
         )
         
-        # 批量生成嵌入
-        embeddings = {}
+        # 生成嵌入
+        embeddings_dict = {}
         failed_count = 0
-        failed_images = []  # 记录失败的图像
         
+        print("开始生成图像嵌入...")
         self.model.eval()
+        
         with torch.no_grad():
-            progress_bar = tqdm(dataloader, desc="生成图像嵌入")
-            
-            for batch_images, batch_asins, batch_success in progress_bar:
-                batch_images = batch_images.to(self.device, non_blocking=True)
+            for batch_images, batch_asins, batch_success in tqdm(dataloader, desc="处理图像批次"):
+                # 移动到指定设备
+                batch_images = batch_images.to(self.device)
                 
-                # 生成图像嵌入
+                # 使用CLIP模型生成图像特征
                 if self.model_type == 'clip':
                     image_features = self.model.encode_image(batch_images)
-                    # 归一化嵌入向量
-                    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                    # L2归一化
+                    image_features = F.normalize(image_features, p=2, dim=1)
                 
-                # 转换为CPU numpy数组并保存
-                image_features_cpu = image_features.cpu().numpy()
+                # 转换为numpy并存储
+                image_features_np = image_features.cpu().numpy()
                 
                 for i, (asin, success) in enumerate(zip(batch_asins, batch_success)):
                     if success:
-                        embeddings[asin] = image_features_cpu[i]
+                        embeddings_dict[asin] = image_features_np[i]
                     else:
                         failed_count += 1
-                        failed_images.append(asin)  # 记录失败的ASIN
                 
-                # 更新进度条信息
-                progress_bar.set_postfix({
-                    ' 成功': len(embeddings),
-                    '失败': failed_count,
-                    'GPU内存': f"{torch.cuda.memory_allocated() / 1024**3:.1f}GB"
-                })
-                
-                # 定期清理GPU内存
-                if len(embeddings) % (batch_size * 10) == 0:
+                # 清理GPU缓存
+                if self.device == 'cuda':
                     torch.cuda.empty_cache()
         
-        print(f"\n✅ 嵌入生成完成!")
-        print(f"  - 成功生成: {len(embeddings)} 个")
-        print(f"  - 失败: {failed_count} 个")
-        print(f"  - 嵌入维度: {list(embeddings.values())[0].shape if embeddings else 'N/A'}")
+        print(f"✅ 嵌入生成完成!")
+        print(f"   - 成功处理: {len(embeddings_dict)} 个图像")
+        print(f"   - 处理失败: {failed_count} 个图像")
         
-        # 如果有失败的图像，记录到文件
-        if failed_images:
-            failed_log_file = os.path.join(os.path.dirname(image_dir), 'failed_image_embeddings.txt')
-            with open(failed_log_file, 'w') as f:
-                f.write("失败生成嵌入的图像列表:\n")
-                f.write("=" * 40 + "\n")
-                for asin in failed_images:
-                    f.write(f"{asin}\n")
-            print(f"  - 失败图像列表已保存到: {failed_log_file}")
-        
-        return embeddings
+        return embeddings_dict
 
-def map_asins_to_item_ids(embeddings, mapping_file):
-    """将ASIN键转换为item_id键，用于与训练代码兼容"""
-    if not os.path.exists(mapping_file):
-        print(f"⚠️  映射文件不存在: {mapping_file}")
-        print("   将使用ASIN作为键返回嵌入")
-        return embeddings
-    
-    print("正在加载ASIN到item_id的映射...")
-    with open(mapping_file, 'rb') as f:
-        asin_to_itemid = pickle.load(f)
-    
-    # 转换键从ASIN到item_id
-    itemid_embeddings = {}
-    missing_count = 0
-    
-    for asin, embedding in embeddings.items():
-        if asin in asin_to_itemid:
-            item_id = asin_to_itemid[asin]
-            itemid_embeddings[item_id] = embedding
-        else:
-            missing_count += 1
-    
-    print(f"✅ 键转换完成:")
-    print(f"  - 成功映射: {len(itemid_embeddings)} 个")
-    print(f"  - 映射缺失: {missing_count} 个")
-    
-    return itemid_embeddings
 
 def main():
-    parser = argparse.ArgumentParser(description='图像嵌入生成器')
-    parser.add_argument('--model_type', type=str, default='clip', 
-                       choices=['clip'], help='视觉模型类型')
-    parser.add_argument('--input_dir', type=str, required=True,
-                       help='输入图像目录')
-    parser.add_argument('--output_file', type=str, required=True,
-                       help='输出嵌入文件路径 (.npy)')
-    parser.add_argument('--batch_size', type=int, default=32,
-                       help='批处理大小 (4090建议32-64)')
-    parser.add_argument('--num_workers', type=int, default=4,
-                       help='数据加载器工作线程数')
-    parser.add_argument('--device', type=str, default='cuda',
-                       help='计算设备')
-    parser.add_argument('--use_item_id_keys', action='store_true',
-                       help='使用item_id作为键 (用于训练兼容性)')
+    """主函数 - 解析参数并执行图像嵌入生成"""
+    # 默认配置
+    IMAGE_DIR = 'data/book_covers_enhanced'
+    OUTPUT_FILE = 'data/book_image_embeddings.npy'
+    BATCH_SIZE = 32
+    NUM_WORKERS = 4
     
-    args = parser.parse_args()
+    print("=== 图像嵌入生成器 ===\n")
     
     # 检查输入目录
-    if not os.path.exists(args.input_dir):
-        print(f"❌ 输入目录不存在: {args.input_dir}")
+    if not os.path.exists(IMAGE_DIR):
+        print(f"❌ 图像目录不存在: {IMAGE_DIR}")
+        print("请确保已将书籍封面图像放入该目录")
         return
     
     # 检查CUDA可用性
-    if args.device == 'cuda' and not torch.cuda.is_available():
-        print("⚠️  CUDA不可用，将使用CPU (速度较慢)")
-        args.device = 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if device == 'cpu':
+        print("⚠️  未检测到CUDA，将使用CPU (处理速度较慢)")
     
-    print("🚀 图像嵌入生成器启动")
-    print("=" * 50)
-    print(f"模型类型: {args.model_type}")
-    print(f"输入目录: {args.input_dir}")
-    print(f"输出文件: {args.output_file}")
-    print(f"批处理大小: {args.batch_size}")
-    print(f"计算设备: {args.device}")
-    if args.device == 'cuda':
+    print(f"配置信息:")
+    print(f"  - 图像目录: {IMAGE_DIR}")
+    print(f"  - 输出文件: {OUTPUT_FILE}")
+    print(f"  - 批处理大小: {BATCH_SIZE}")
+    print(f"  - 计算设备: {device}")
+    
+    if device == 'cuda':
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"  - GPU: {gpu_name} ({gpu_memory:.1f}GB)")
+    
+    print()
+    
+    try:
+        # 创建生成器并生成嵌入
+        generator = ImageEmbeddingGenerator(model_type='clip', device=device)
+        embeddings = generator.generate_embeddings(
+            image_dir=IMAGE_DIR,
+            batch_size=BATCH_SIZE,
+            num_workers=NUM_WORKERS
+        )
+        
+        if not embeddings:
+            print("❌ 未生成任何嵌入")
+            return
+        
+        # 保存嵌入到文件
+        print(f"\n正在保存嵌入到 {OUTPUT_FILE}...")
+        os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+        np.save(OUTPUT_FILE, embeddings)
+        
+        print("✅ 图像嵌入生成完成!")
+        print(f"   - 总嵌入数: {len(embeddings)}")
+        sample_embedding = next(iter(embeddings.values()))
+        print(f"   - 嵌入维度: {sample_embedding.shape}")
+        print(f"   - 已保存至: {OUTPUT_FILE}")
+        
+    except Exception as e:
+        print(f"❌ 生成过程中发生错误: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
         print(f"GPU型号: {torch.cuda.get_device_name()}")
         print(f"GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
     print("=" * 50)

@@ -48,11 +48,13 @@ class GENIUSRecModel(nn.Module):
         if self.encoder_projection is not None:
             encoder_output = self.encoder_projection(encoder_output)
         
-        # 将参数一路传递给解码器
+        # 将参数一路传递给解码器, 并直接返回解码器的输出
         return self.decoder(
             target_ids=target_ids, 
             encoder_output=encoder_output, 
             memory_padding_mask=source_padding_mask,
             force_equal_weights=force_equal_weights, 
-            return_weights=return_weights
+            return_weights=return_weights,
+            # 显式传递 is_training
+            is_training=self.training 
         )

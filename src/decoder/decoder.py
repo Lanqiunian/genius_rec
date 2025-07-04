@@ -131,8 +131,12 @@ class GenerativeDecoder(nn.Module):
         # 2. 内容专家 (Content Expert) - 基于文本嵌入
         if self.expert_config["experts"]["content_expert"]:
             content_config = self.expert_config["content_expert"]
-            self.text_embedding = nn.Embedding(num_items, content_config["text_embedding_dim"], padding_idx=pad_token_id)
-            self.text_embedding.weight.requires_grad = False
+            # 🚀 优化：不在初始化时创建大型Embedding，使用register_buffer延迟加载
+            # self.text_embedding = nn.Embedding(num_items, content_config["text_embedding_dim"], padding_idx=pad_token_id)
+            # self.text_embedding.weight.requires_grad = False
+            
+            # 先注册一个空的buffer，后续通过load_text_embeddings填充
+            self.register_buffer('text_embedding_matrix', torch.zeros(1, 1))  # 占位符
             
             if content_config.get("use_cross_attention", True):
                 self.content_expert_attention = nn.MultiheadAttention(
@@ -147,7 +151,7 @@ class GenerativeDecoder(nn.Module):
                 self.content_expert_fc = nn.Linear(embedding_dim, content_config["text_embedding_dim"])
         else:
             # 🔧 修复：专家被禁用时，将相关层设为None
-            self.text_embedding = None
+            self.text_embedding_matrix = None
             self.content_expert_attention = None
             self.content_attention_projection = None
             self.content_expert_fc = None
@@ -155,8 +159,12 @@ class GenerativeDecoder(nn.Module):
         # 3. 图像专家 (Image Expert) - 基于书封面嵌入 🎨
         if self.expert_config["experts"]["image_expert"]:
             image_config = self.expert_config["image_expert"]
-            self.image_embedding = nn.Embedding(num_items, image_config["image_embedding_dim"], padding_idx=pad_token_id)
-            self.image_embedding.weight.requires_grad = False
+            # 🚀 优化：不在初始化时创建大型Embedding，使用register_buffer延迟加载
+            # self.image_embedding = nn.Embedding(num_items, image_config["image_embedding_dim"], padding_idx=pad_token_id)
+            # self.image_embedding.weight.requires_grad = False
+            
+            # 先注册一个空的buffer，后续通过load_image_embeddings填充
+            self.register_buffer('image_embedding_matrix', torch.zeros(1, 1))  # 占位符
             
             if image_config.get("use_cross_attention", True):
                 self.image_expert_attention = nn.MultiheadAttention(
@@ -169,8 +177,8 @@ class GenerativeDecoder(nn.Module):
             else:
                 self.image_expert_fc = nn.Linear(embedding_dim, image_config["image_embedding_dim"])
         else:
-            # 🔧 修复：专家被禁用时，将相关层设为None
-            self.image_embedding = None
+            # 🔧 修复：图像专家被禁用时，将相关层设为None
+            self.image_embedding_matrix = None
             self.image_expert_attention = None
             self.image_attention_projection = None
             self.image_expert_fc = None
@@ -183,55 +191,55 @@ class GenerativeDecoder(nn.Module):
                 nn.Linear(embedding_dim, gate_config.get("gate_hidden_dim", 64)),
                 nn.ReLU(),
                 nn.Linear(gate_config.get("gate_hidden_dim", 64), num_experts),
-                nn.Softmax(dim=-1)
+                # nn.Softmax(dim=-1)
             )
         else:
             # 原始的简单线性门控（与原代码一致）
             self.gate_network = nn.Sequential(
                 nn.Linear(embedding_dim, num_experts),
-                nn.Softmax(dim=-1)
+                # nn.Softmax(dim=-1)
             )
         # =================================================================
 
-    def load_text_embeddings(self, embedding_matrix: torch.Tensor):
+    def load_text_embeddings(self, embedding_matrix: torch.Tensor, verbose: bool = True):
         """
         加载预训练的文本嵌入矩阵。
+        
+        Args:
+            embedding_matrix: 文本嵌入矩阵
+            verbose: 是否输出日志信息，默认True
         """
         if not self.expert_config["experts"]["content_expert"]:
-            print("⚠️  内容专家未启用，跳过文本嵌入加载")
+            if verbose:
+                print("⚠️  内容专家未启用，跳过文本嵌入加载")
             return
         
-        # 🔧 修复：检查text_embedding是否存在
-        if self.text_embedding is None:
-            print("❌ 内容专家相关层未初始化，无法加载文本嵌入")
-            return
-            
-        if self.text_embedding.weight.shape != embedding_matrix.shape:
-            raise ValueError(f"文本嵌入形状不匹配! 模型期望 {self.text_embedding.weight.shape}, 但得到 {embedding_matrix.shape}")
-        
-        print("📄 正在加载预训练文本嵌入...")
-        self.text_embedding.weight.data.copy_(embedding_matrix)
-        print("✅ 文本嵌入加载成功")
+        # � 优化：直接替换buffer而不是使用Embedding层
+        if verbose:
+            print("📄 正在加载预训练文本嵌入...")
+        self.text_embedding_matrix = embedding_matrix.clone()
+        if verbose:
+            print("✅ 文本嵌入加载成功")
 
-    def load_image_embeddings(self, embedding_matrix: torch.Tensor):
+    def load_image_embeddings(self, embedding_matrix: torch.Tensor, verbose: bool = True):
         """
         加载预训练的图像嵌入矩阵（书封面嵌入）。【新增】
+        
+        Args:
+            embedding_matrix: 图像嵌入矩阵
+            verbose: 是否输出日志信息，默认True
         """
         if not self.expert_config["experts"]["image_expert"]:
-            print("⚠️  图像专家未启用，跳过图像嵌入加载")
+            if verbose:
+                print("⚠️  图像专家未启用，跳过图像嵌入加载")
             return
         
-        # 🔧 修复：检查image_embedding是否存在
-        if self.image_embedding is None:
-            print("❌ 图像专家相关层未初始化，无法加载图像嵌入")
-            return
-            
-        if self.image_embedding.weight.shape != embedding_matrix.shape:
-            raise ValueError(f"图像嵌入形状不匹配! 模型期望 {self.image_embedding.weight.shape}, 但得到 {embedding_matrix.shape}")
-        
-        print("🖼️  正在加载预训练图像嵌入...")
-        self.image_embedding.weight.data.copy_(embedding_matrix)
-        print("✅ 图像嵌入加载成功")
+        # � 优化：直接替换buffer而不是使用Embedding层
+        if verbose:
+            print("🖼️  正在加载预训练图像嵌入...")
+        self.image_embedding_matrix = embedding_matrix.clone()
+        if verbose:
+            print("✅ 图像嵌入加载成功")
 
     @staticmethod
     def _generate_square_subsequent_mask(sz: int):
@@ -241,7 +249,8 @@ class GenerativeDecoder(nn.Module):
 
     def forward(self, target_ids: torch.Tensor, encoder_output: torch.Tensor, memory_padding_mask: torch.Tensor, 
                 force_equal_weights: bool = False, # 【新增】外部控制标志
-                return_weights: bool = False):
+                return_weights: bool = False,
+                is_training: bool = False): # 【新增】接收 is_training 标志
         
         batch_size, target_len = target_ids.size()
         positions = torch.arange(0, target_len, device=target_ids.device).unsqueeze(0)
@@ -270,7 +279,14 @@ class GenerativeDecoder(nn.Module):
                                       equal_weight, device=target_ids.device)
         else:
             # 正常模式：使用门控网络权重并确保归一化
-            expert_weights = self.gate_network(hidden_state)  # (B, T, num_experts)
+            # 💡 核心修复：统一使用序列的平均表征作为门控输入
+            # (B, T, D) -> (B, D)
+            gate_input = hidden_state.mean(dim=1) 
+            # (B, D) -> (B, num_experts)
+            gate_weights_single = self.gate_network(gate_input)
+            # (B, num_experts) -> (B, 1, num_experts) -> (B, T, num_experts)
+            expert_weights = gate_weights_single.unsqueeze(1).expand(-1, target_len, -1)
+            
             # 确保权重和为1（防止数值不稳定）
             expert_weights = F.softmax(expert_weights, dim=-1)
             
@@ -292,9 +308,9 @@ class GenerativeDecoder(nn.Module):
         if self.expert_config["experts"]["content_expert"]:
             content_config = self.expert_config["content_expert"]
             
-            # 🔧 修复：确保相关层存在才进行计算
-            if self.text_embedding is None:
-                raise RuntimeError("内容专家已启用但相关层未初始化！")
+            # � 优化：检查嵌入矩阵是否已加载
+            if self.text_embedding_matrix is None or self.text_embedding_matrix.numel() <= 1:
+                raise RuntimeError("内容专家已启用但文本嵌入矩阵未加载！请先调用load_text_embeddings()")
             
             if content_config.get("use_cross_attention", True):
                 if self.content_expert_attention is None or self.content_attention_projection is None:
@@ -308,7 +324,8 @@ class GenerativeDecoder(nn.Module):
                     raise RuntimeError("内容专家线性层未初始化！")
                 content_query = self.content_expert_fc(hidden_state)
             
-            all_text_embeddings = self.text_embedding.weight.transpose(0, 1)
+            # 🚀 优化：直接使用预加载的嵌入矩阵，避免Embedding层的内存开销
+            all_text_embeddings = self.text_embedding_matrix.transpose(0, 1)  # (embedding_dim, num_items)
             content_logits = torch.matmul(content_query, all_text_embeddings)
             
             weight = expert_weights[:, :, expert_idx].unsqueeze(-1)  # (B, T, 1)
@@ -324,9 +341,9 @@ class GenerativeDecoder(nn.Module):
         if self.expert_config["experts"]["image_expert"]:
             image_config = self.expert_config["image_expert"]
             
-            # 🔧 修复：确保相关层存在才进行计算
-            if self.image_embedding is None:
-                raise RuntimeError("图像专家已启用但相关层未初始化！")
+            # � 优化：检查嵌入矩阵是否已加载
+            if self.image_embedding_matrix is None or self.image_embedding_matrix.numel() <= 1:
+                raise RuntimeError("图像专家已启用但图像嵌入矩阵未加载！请先调用load_image_embeddings()")
             
             if image_config.get("use_cross_attention", True):
                 if self.image_expert_attention is None or self.image_attention_projection is None:
@@ -345,8 +362,8 @@ class GenerativeDecoder(nn.Module):
                 # 使用简单线性投影
                 visual_query = self.image_expert_fc(hidden_state)
             
-            # 计算与所有图像嵌入的相似度
-            all_image_embeddings = self.image_embedding.weight.transpose(0, 1)
+            # 🚀 优化：直接使用预加载的嵌入矩阵，避免Embedding层的内存开销
+            all_image_embeddings = self.image_embedding_matrix.transpose(0, 1)  # (embedding_dim, num_items)
             image_logits = torch.matmul(visual_query, all_image_embeddings)
             
             weight = expert_weights[:, :, expert_idx].unsqueeze(-1)  # (B, T, 1)

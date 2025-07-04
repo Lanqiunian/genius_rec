@@ -21,6 +21,12 @@ from torch.utils.data import DataLoader, Dataset
 from src.config import get_config
 from src.GeniusRec import GENIUSRecModel
 from src.dataset import Seq2SeqRecDataset
+from src.unified_evaluation import (
+    ValidationDataset, 
+    evaluate_model_validation, 
+    evaluate_model_test, 
+    evaluate_model_validation_with_ranking
+)
 
 from src.encoder.encoder import Hstu
 from src.decoder.decoder import GenerativeDecoder
@@ -32,84 +38,20 @@ from src.decoder.decoder import GenerativeDecoder
 # # 冻结编码器训练（对比实验）
 # python -m src.train_GeniusRec --encoder_weights_path checkpoints/hstu_encoder.pth --freeze_encoder
 
+# # 使用与HSTU完全一致的全量评估模式（评估所有物品）
+# python -m src.train_GeniusRec --encoder_weights_path checkpoints/hstu_encoder.pth --full_evaluation
+
+# # 或者使用采样评估（速度更快，指定候选物品数量）
+# python -m src.train_GeniusRec --encoder_weights_path checkpoints/hstu_encoder.pth --sample_eval_size 1000
+
 # # 从检查点恢复训练
 # python -m src.train_GeniusRec --resume_from checkpoints/genius_rec_moe_latest.pth --encoder_weights_path checkpoints/hstu_encoder.pth
 
 # # 自定义保存目录
 # python -m src.train_GeniusRec --save_dir my_checkpoints
 
-class ValidationDataset(Dataset):
-    """
-    用于排序指标评估的数据集：
-    - 只从验证/测试集中取数据
-    - 使用Leave-One-Out方式评估
-    - 确保训练时没有见过完整序列
-    """
-    def __init__(self, data_path, max_len, pad_token_id=0):
-        self.data = pd.read_parquet(data_path)
-        self.max_len = max_len
-        self.pad_token_id = pad_token_id
 
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        full_seq = self.data.iloc[idx]['history']
-        # Leave-One-Out: 最后一个作为目标，其余作为输入
-        ground_truth_item = full_seq[-1]
-        input_seq = full_seq[:-1]
-        
-        # 截断和填充
-        if len(input_seq) > self.max_len:
-            input_seq = input_seq[-self.max_len:]
-        
-        padded_input_seq = np.full(self.max_len, self.pad_token_id, dtype=np.int64)
-        padded_input_seq[-len(input_seq):] = input_seq
-        
-        return {
-            'input_ids': torch.tensor(padded_input_seq, dtype=torch.long),
-            'ground_truth': torch.tensor(ground_truth_item, dtype=torch.long)
-        }
-
-def compute_ranking_metrics(user_embeddings, all_item_embeddings, target_item_ids, k=10):
-    """
-    计算HR@K和NDCG@K指标
-    """
-    batch_size = user_embeddings.size(0)
-    
-    # L2归一化
-    user_embeddings = F.normalize(user_embeddings, p=2, dim=1)
-    all_item_embeddings = F.normalize(all_item_embeddings, p=2, dim=1)
-    
-    # 计算余弦相似度
-    scores = torch.matmul(user_embeddings, all_item_embeddings.t())
-    
-    # 排序
-    _, sorted_indices = torch.sort(scores, dim=1, descending=True)
-    
-    hr_list, ndcg_list = [], []
-    
-    for i in range(batch_size):
-        target_id = target_item_ids[i].item()
-        if target_id == 0: 
-            continue
-
-        target_idx = target_id - 1  # ID到索引的转换
-        target_rank_positions = (sorted_indices[i] == target_idx).nonzero(as_tuple=True)[0]
-        
-        hr, ndcg = 0.0, 0.0
-        if len(target_rank_positions) > 0:
-            rank = target_rank_positions[0].item() + 1
-            if rank <= k:
-                hr = 1.0
-                ndcg = 1.0 / np.log2(rank + 1)
-        
-        hr_list.append(hr)
-        ndcg_list.append(ndcg)
-    
-    return hr_list, ndcg_list
-
-def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, epoch, num_epochs, pad_token_id, force_equal_weights=False):
+def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, epoch, num_epochs, pad_token_id, force_equal_weights=False, scaler=None):
     """
     训练一个epoch，并实时监控损失和专家权重。
 
@@ -145,29 +87,57 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
 
         optimizer.zero_grad()
         
-        # ==================== ✨ 核心修改 ✨ ====================
-        # 调用模型时，传入force_equal_weights并要求返回权重
-        logits, gate_weights = model(
-            source_ids, 
-            decoder_input_ids, 
-            source_padding_mask,
-            force_equal_weights=force_equal_weights, # 传入控制标志
-            return_weights=True                      # 要求返回权重以供监控
-        )
-        # =======================================================
+        # 🚀 显存优化：使用混合精度训练
+        try:
+            with torch.amp.autocast('cuda', enabled=(scaler is not None)):
+                # ==================== ✨ 核心修改 ✨ ====================
+                # 调用模型时，传入force_equal_weights并要求返回权重
+                logits, gate_weights = model(
+                    source_ids, 
+                    decoder_input_ids, 
+                    source_padding_mask,
+                    force_equal_weights=force_equal_weights, # 传入控制标志
+                    return_weights=True                      # 要求返回权重以供监控
+                )
+                # =======================================================
 
-        # 计算损失 (保持不变)
-        loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
+                # 计算损失 (保持不变)
+                loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
+        except AttributeError:
+            # 兼容旧版本PyTorch
+            with torch.cuda.amp.autocast(enabled=(scaler is not None)):
+                logits, gate_weights = model(
+                    source_ids, 
+                    decoder_input_ids, 
+                    source_padding_mask,
+                    force_equal_weights=force_equal_weights,
+                    return_weights=True
+                )
+                loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
         
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        # 🚀 显存优化：先保存loss值，避免在删除后使用
+        loss_value = loss.item()
+        
+        # 🚀 混合精度：使用scaler进行反向传播
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+        
+        # 🚀 显存优化：立即清理中间计算图
+        del logits, loss
         
         # 仅在需要时更新学习率 (取决于您的scheduler类型)
         if scheduler is not None:
              scheduler.step()
         
-        total_loss += loss.item()
+        total_loss += loss_value
         
         # --- 实时更新进度条后缀 ---
         if gate_weights is not None:
@@ -189,8 +159,16 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
                     
                     weights_postfix[display_name] = f"{gate_weights[:, :, i].mean().item():.3f}"
 
+        # 清理gate_weights的显存
+        if gate_weights is not None:
+            del gate_weights
+        
+        # 🚀 显存优化：每隔几个batch清理一次显存
+        if batch_idx % 10 == 0:
+            torch.cuda.empty_cache()
+
         # 更新进度条的显示信息，合并loss和权重
-        current_postfix = {'loss': f"{loss.item():.4f}", **weights_postfix}
+        current_postfix = {'loss': f"{loss_value:.4f}", **weights_postfix}
         progress_bar.set_postfix(current_postfix)
         
     avg_loss = total_loss / len(dataloader)
@@ -201,109 +179,6 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
     
     return avg_loss # <-- 保持返回值不变
 
-def evaluate_model_validation(model, val_loader, criterion, device, epoch, num_epochs, pad_token_id):
-    """
-    验证集评估：只计算loss和ppl，用于早停和模型选择
-    """
-    model.eval()
-    
-    total_loss_tokens = 0.0
-    total_tokens = 0
-    total_gate_weights = None
-    total_valid_batches = 0
-
-    progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Validation]")
-
-    with torch.no_grad():
-        for batch in progress_bar:
-            source_ids = batch['source_ids'].to(device)
-            decoder_input_ids = batch['decoder_input_ids'].to(device)
-            labels = batch['labels'].to(device)
-            source_padding_mask = (source_ids == pad_token_id)
-
-            logits, gate_weights = model(source_ids, decoder_input_ids, source_padding_mask, return_weights=True)
-            
-            # 修正：使用传统的CrossEntropyLoss调用方式
-            loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
-            
-            valid_tokens = (labels.view(-1) != pad_token_id).sum().item()
-            total_loss_tokens += loss.item() * valid_tokens
-            total_tokens += valid_tokens
-
-            # 累计门控权重（动态支持多个专家）
-            non_padding_mask = (decoder_input_ids != pad_token_id)
-            if gate_weights.size(-1) > 0:  # 确保有专家
-                masked_gate_weights = gate_weights[non_padding_mask]  # (N, num_experts)
-                if masked_gate_weights.numel() > 0:
-                    if total_gate_weights is None:
-                        total_gate_weights = masked_gate_weights.mean(dim=0)  # (num_experts,)
-                        total_valid_batches = 1
-                    else:
-                        total_gate_weights += masked_gate_weights.mean(dim=0)
-                        total_valid_batches += 1
-
-            progress_bar.set_postfix(loss=loss.item())
-
-    avg_loss = total_loss_tokens / total_tokens if total_tokens > 0 else 0
-    perplexity = math.exp(avg_loss) if avg_loss < 20 else float('inf')
-    
-    # 计算平均门控权重
-    avg_gate_weights = total_gate_weights / total_valid_batches if total_valid_batches > 0 else None
-    
-    result = {
-        'val_loss': avg_loss,
-        'val_ppl': perplexity,
-    }
-    
-    # 动态添加专家权重信息
-    if avg_gate_weights is not None:
-        enabled_experts = [k for k, v in model.decoder.expert_config["experts"].items() if v]
-        for i, expert_name in enumerate(enabled_experts):
-            if i < len(avg_gate_weights):
-                result[f'avg_{expert_name}_weight'] = avg_gate_weights[i].item()
-    
-    return result
-
-def evaluate_model_test(model, test_loader, device, item_num, top_k=10):
-    """
-    测试集评估：只计算排序指标，训练结束后调用一次
-    """
-    model.eval()
-    all_hr_scores, all_ndcg_scores = [], []
-    
-    with torch.no_grad():
-        # 预先计算所有物品嵌入，避免重复计算
-        all_item_ids = torch.arange(1, item_num, device=device)
-        all_item_embeddings = model.encoder.item_embedding(all_item_ids)
-        
-        progress_bar = tqdm(test_loader, desc="Test Set Evaluation")
-        
-        for batch in progress_bar:
-            input_ids = batch['input_ids'].to(device)
-            ground_truth_ids = batch['ground_truth'].to(device)
-
-            # 获取用户嵌入
-            encoder_output = model.encoder(input_ids)
-            user_embeddings = encoder_output[:, -1, :]  # 取最后一个位置
-            
-            # 计算HR和NDCG
-            hr_list, ndcg_list = compute_ranking_metrics(
-                user_embeddings,
-                all_item_embeddings,
-                ground_truth_ids,
-                k=top_k
-            )
-            all_hr_scores.extend(hr_list)
-            all_ndcg_scores.extend(ndcg_list)
-    
-    avg_hr = np.mean(all_hr_scores) if all_hr_scores else 0.0
-    avg_ndcg = np.mean(all_ndcg_scores) if all_ndcg_scores else 0.0
-    
-    return {
-        'test_hr': avg_hr,
-        'test_ndcg': avg_ndcg,
-        'evaluated_samples': len(all_hr_scores)
-    }
 
 def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device):
     """
@@ -387,8 +262,8 @@ def save_checkpoint(checkpoint_path, model, optimizer, scheduler, epoch, metrics
         'num_items': num_items,
         **metrics_dict  # 展开所有指标
     }
-    
     torch.save(checkpoint_data, checkpoint_path)
+
 
 def main():
     # 1. 参数解析和配置加载
@@ -398,12 +273,16 @@ def main():
     parser.add_argument('--resume_from', type=str, default=None, help='Path to checkpoint to resume from.')
     parser.add_argument('--save_dir', type=str, default=None, help='Directory to save checkpoints.')
     
-    # 【新增】专家系统控制参数
+    # 专家系统控制参数
     parser.add_argument('--disable_behavior_expert', action='store_true', help='Disable behavior expert.')
     parser.add_argument('--disable_content_expert', action='store_true', help='Disable content expert.')
     parser.add_argument('--disable_image_expert', action='store_true', help='Disable image expert.')
     parser.add_argument('--enable_image_expert', action='store_true', help='Enable image expert (requires image embeddings).')
     parser.add_argument('--image_embeddings_path', type=str, default=None, help='Path to image embeddings file.')
+    
+    # 评估方法控制参数
+    parser.add_argument('--full_evaluation', action='store_true', help='使用全量评估(与所有物品计算相似度)，与HSTU和baseline完全一致，但速度较慢。')
+    parser.add_argument('--sample_eval_size', type=int, default=500, help='采样评估的候选物品数量，默认为500，设为0使用全量评估。')
     
     args = parser.parse_args()
 
@@ -421,6 +300,15 @@ def main():
     
     # 2. 环境设置
     device = torch.device(config['device'])
+    
+    # 🚀 显存优化：设置PyTorch显存管理参数
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True  # 优化cudnn性能
+        torch.cuda.empty_cache()  # 清理显存碎片
+        # 设置显存分配策略，避免碎片化
+        import os
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    
     random.seed(config['seed'])
     np.random.seed(config['seed'])
     torch.manual_seed(config['seed'])
@@ -463,10 +351,26 @@ def main():
     logging.info(f"  - Number of special tokens: {num_special_tokens}")
     logging.info(f"  - Total vocabulary size: {total_vocab_size}")
     logging.info(f"  - Special tokens: {id_maps.get('special_tokens', {})}")
+    
+    # 🔧 修复：定义num_items变量以供后续使用
+    num_items = total_vocab_size
+    
+    # 🔧 新增：配置一致性检查
+    if config['encoder_model']['max_len'] != config['decoder_model']['max_seq_len']:
+        logging.warning(f"编码器max_len({config['encoder_model']['max_len']}) != 解码器max_seq_len({config['decoder_model']['max_seq_len']})")
+        logging.warning("这可能导致序列处理不一致，建议检查配置")
+    
+    # 🔧 新增：专家系统一致性检查
+    enabled_experts = [k for k, v in config['expert_system']['experts'].items() if v]
+    if len(enabled_experts) == 0:
+        logging.error("❌ 至少需要启用一个专家！请检查expert_config配置")
+        return
+    
+    logging.info(f"🧠 已启用专家: {enabled_experts}")
 
     # 使用新的配置系统初始化数据集
-    train_dataset = Seq2SeqRecDataset(config, config['data']['train_file'], config['finetune']['split_ratio'])
-    val_dataset = Seq2SeqRecDataset(config, config['data']['validation_file'], config['finetune']['split_ratio'])
+    train_dataset = Seq2SeqRecDataset(config, config['data']['train_file'])
+    val_dataset = Seq2SeqRecDataset(config, config['data']['validation_file'])
     test_dataset = ValidationDataset(
         config['data']['test_file'],  # 使用独立的测试集
         config['encoder_model']['max_len'],
@@ -538,17 +442,23 @@ def main():
     # 7. 预训练权重加载（优先使用迁移后的权重）
     if args.encoder_weights_path:
         try:
-            # 检查是否存在迁移后的权重文件
+            # 检查是否为迁移后的权重文件
             weights_path = Path(args.encoder_weights_path)
-            migrated_weights_path = weights_path.parent / f"{weights_path.stem}_migrated.pth"
             
-            if migrated_weights_path.exists():
-                logging.info(f"Found migrated weights, loading from: {migrated_weights_path}")
-                load_path = migrated_weights_path
-            else:
-                logging.info(f"Loading original encoder weights from: {weights_path}")
-                logging.warning("⚠️  使用原始权重可能导致维度不匹配，建议先运行权重迁移脚本")
+            if "_migrated" in weights_path.stem:
+                logging.info(f"Loading migrated encoder weights from: {weights_path}")
                 load_path = weights_path
+            else:
+                # 检查是否存在迁移后的权重文件
+                migrated_weights_path = weights_path.parent / f"{weights_path.stem}_migrated.pth"
+                
+                if migrated_weights_path.exists():
+                    logging.info(f"Found migrated weights, loading from: {migrated_weights_path}")
+                    load_path = migrated_weights_path
+                else:
+                    logging.info(f"Loading original encoder weights from: {weights_path}")
+                    logging.warning("⚠️  使用原始权重可能导致维度不匹配，建议先运行权重迁移脚本")
+                    load_path = weights_path
             
             checkpoint = torch.load(load_path, map_location=device, weights_only=False)
             
@@ -618,14 +528,15 @@ def main():
                     # 🔧 修复：更新配置但不重新初始化整个模型
                     config['expert_system']['image_expert']['image_embedding_dim'] = image_embedding_dim
                     
-                    # 检查模型的图像嵌入层维度是否匹配
-                    current_image_dim = model.decoder.image_embedding.weight.shape[1] if hasattr(model.decoder, 'image_embedding') else None
+                    # 🔧 修复：从配置中获取当前维度，而不是从占位符矩阵
+                    current_image_dim = config['expert_system']['image_expert'].get('image_embedding_dim', None)
                     
+                    # 只有当配置中的维度与实际文件维度不匹配时才重新初始化
                     if current_image_dim != image_embedding_dim:
-                        logging.warning(f"图像嵌入维度不匹配: 模型={current_image_dim}, 文件={image_embedding_dim}")
+                        logging.warning(f"图像嵌入维度不匹配: 配置={current_image_dim}, 文件={image_embedding_dim}")
                         logging.info("需要重新初始化模型以适配图像嵌入维度...")
                         
-                        # 只有在维度不匹配时才重新初始化
+                        # 重新初始化模型
                         model = GENIUSRecModel(
                             config['encoder_model'], 
                             config['decoder_model'],
@@ -657,8 +568,8 @@ def main():
                                     for param in model.encoder.parameters():
                                         param.requires_grad = False
                                         
-                                # 重新加载文本嵌入
-                                model.decoder.load_text_embeddings(text_embedding_matrix.to(device))
+                                # 重新加载文本嵌入（静默模式，避免重复日志）
+                                model.decoder.load_text_embeddings(text_embedding_matrix.to(device), verbose=False)
                                 
                             except Exception as e:
                                 logging.error(f"重新加载编码器权重失败: {e}")
@@ -702,6 +613,13 @@ def main():
             logging.info("🔄 Disabling visual expert for this run...")
             config['expert_system']['experts']['image_expert'] = False
 
+    # 🚀 显存优化：启用混合精度训练
+    try:
+        scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
+    except AttributeError:
+        # 兼容旧版本PyTorch
+        scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+    
     # 9. 优化器和损失函数
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()), 
@@ -711,7 +629,9 @@ def main():
 
 
     # 标签平滑
-    criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id, label_smoothing=config['finetune'].get('label_smoothing', 0))
+    label_smoothing = config['finetune'].get('label_smoothing', 0)
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id, label_smoothing=label_smoothing)
+    logging.info(f"📊 损失函数配置: ignore_index={pad_token_id}, label_smoothing={label_smoothing}")
 
     # 10. 学习率调度器
     num_training_steps = len(train_loader) * config['finetune']['num_epochs']
@@ -758,13 +678,23 @@ def main():
         avg_train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, scheduler, 
             device, epoch, config['finetune']['num_epochs'], pad_token_id,
-            force_equal_weights=is_warmup_phase
+            force_equal_weights=is_warmup_phase, scaler=scaler
         )
         
-        # 验证集评估（只计算loss和ppl）
-        eval_results = evaluate_model_validation(
+        # 验证集评估（计算loss、ppl和排序指标）
+        # 根据命令行参数决定使用全量评估还是采样评估
+        num_candidates = None if (args.full_evaluation or args.sample_eval_size == 0) else args.sample_eval_size
+        
+        # 记录评估模式
+        if num_candidates is None:
+            logging.info(f"使用全量评估模式 (与HSTU/baseline一致)")
+        else:
+            logging.info(f"使用采样评估模式，每个用户随机抽取{num_candidates-1}个负样本+1个正样本")
+            
+        eval_results = evaluate_model_validation_with_ranking(
             model, val_loader, criterion, device, 
-            epoch, config['finetune']['num_epochs'], pad_token_id
+            epoch, config['finetune']['num_epochs'], pad_token_id,
+            num_candidates=num_candidates, top_k=top_k
         )
         
         # 日志输出
@@ -772,6 +702,9 @@ def main():
         logging.info(f"  📈 Train Loss: {avg_train_loss:.4f}")
         logging.info(f"  📉 Val Loss: {eval_results['val_loss']:.4f}")
         logging.info(f"  📊 Val PPL: {eval_results['val_ppl']:.4f}")
+        logging.info(f"  🎯 Val HR@{top_k}: {eval_results['val_hr']:.4f}")
+        logging.info(f"  🎯 Val NDCG@{top_k}: {eval_results['val_ndcg']:.4f}")
+        logging.info(f"  📊 Eval samples: {eval_results['evaluated_samples']}")
         
         # 动态显示专家权重
         enabled_experts = [k for k, v in config['expert_system']['experts'].items() if v]
@@ -794,7 +727,11 @@ def main():
         )
         logging.info(f"保存最新检查点到: {latest_model_path}")
 
-        # 修正：只基于验证loss保存最佳模型
+        # 🆕 可选：使用NDCG作为模型选择标准（注释掉原来的loss标准）
+        # if eval_results['val_ndcg'] > best_val_ndcg:  # 🆕 基于NDCG选择最佳模型
+        #     best_val_ndcg = eval_results['val_ndcg']
+        
+        # 🔄 保持原来的loss标准（推荐）
         if eval_results['val_loss'] < best_val_loss:
             best_val_loss = eval_results['val_loss']
             patience_counter = 0
@@ -830,7 +767,14 @@ def main():
         model.load_state_dict(checkpoint['model_state_dict'])
         logging.info("已加载最佳模型进行测试集评估")
         
-        test_results = evaluate_model_test(model, test_loader, device, num_items, top_k)
+        # 🔧 修复：使用专门的测试集评估函数
+        # 测试评估总是使用全量评估，以获得最准确的结果
+        num_candidates = None  # 测试时始终使用全量评估
+        logging.info(f"测试集使用全量评估模式 (与HSTU/baseline完全一致)")
+        
+        test_results = evaluate_model_test(
+            model, test_loader, device, num_items, num_candidates=num_candidates, top_k=top_k
+        )
         
         logging.info(f"📈 Final Test Results:")
         logging.info(f"  🎯 Test HR@{top_k}: {test_results['test_hr']:.4f}")

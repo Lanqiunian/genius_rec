@@ -83,7 +83,13 @@ def main():
     mask_token_id = config['mask_token_id']
     
     # 计算特殊标记的数量，为其预留ID空间
-    num_special_tokens = max(pad_token_id, sos_token_id, eos_token_id, mask_token_id) + 1
+    special_token_ids = [pad_token_id, sos_token_id, eos_token_id, mask_token_id]
+    num_special_tokens = max(special_token_ids) + 1
+    
+    # 🔧 安全检查：确保特殊token ID连续且从0开始
+    expected_special_ids = list(range(len(special_token_ids)))
+    if sorted(special_token_ids) != expected_special_ids:
+        raise ValueError(f"特殊token ID必须连续且从0开始，当前: {sorted(special_token_ids)}, 期望: {expected_special_ids}")
     
     # 【关键修正】重映射后的ID从num_special_tokens开始，为特殊标记留出空间
     ratings['user_id_remap'] = pd.Categorical(ratings['user_id']).codes + num_special_tokens

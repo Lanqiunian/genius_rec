@@ -1,5 +1,7 @@
 import torch
 import math
+import numpy as np
+import torch.nn.functional as F
 
 def get_metrics(batch_logits, batch_labels, k, pad_token_id=0):
     """
@@ -58,3 +60,105 @@ def get_metrics(batch_logits, batch_labels, k, pad_token_id=0):
                 ndcg_scores.append(0.0)
 
     return hr_scores, ndcg_scores
+
+
+def compute_hr_ndcg_full(user_embeddings, all_item_embeddings, target_item_ids, k=10):
+    """
+    全量评估：计算HR@K和NDCG@K（与HSTU完全一致的实现）
+    
+    Args:
+        user_embeddings: 用户嵌入 [batch_size, embed_dim]
+        all_item_embeddings: 所有物品的嵌入 [num_items-1, embed_dim]
+        target_item_ids: 目标物品ID [batch_size]
+        k: 推荐列表长度
+        
+    Returns:
+        hr: HR@k
+        ndcg: NDCG@k
+    """
+    batch_size = user_embeddings.size(0)
+    
+    # L2归一化（对齐官方实现）
+    user_embeddings = F.normalize(user_embeddings, p=2, dim=1)
+    all_item_embeddings = F.normalize(all_item_embeddings, p=2, dim=1)
+    
+    # 计算用户与所有物品的相似度 [batch_size, num_items-1]
+    scores = torch.matmul(user_embeddings, all_item_embeddings.t())
+    
+    # 排序获取排名（降序）
+    _, sorted_indices = torch.sort(scores, dim=1, descending=True)
+    
+    hr_count = 0
+    ndcg_sum = 0.0
+    valid_samples = 0
+    
+    for i in range(batch_size):
+        target_id = target_item_ids[i].item()
+        if target_id == 0:
+            continue
+        valid_samples += 1
+            
+        target_idx = target_id - 1  # ID到索引的转换
+        target_rank_positions = (sorted_indices[i] == target_idx).nonzero(as_tuple=True)[0]
+        
+        if len(target_rank_positions) > 0:
+            rank = target_rank_positions[0].item() + 1
+            
+            if rank <= k:
+                hr_count += 1
+                ndcg_sum += 1.0 / np.log2(rank + 1)
+    
+    # 注意：这里使用有效样本数而非总批次大小
+    hr = hr_count / valid_samples if valid_samples > 0 else 0
+    ndcg = ndcg_sum / valid_samples if valid_samples > 0 else 0
+    
+    return hr, ndcg
+
+
+def compute_hr_ndcg_batch(user_embeddings, all_item_embeddings, target_item_ids, k=10):
+    """
+    全量评估：计算HR@K和NDCG@K（返回每个样本的结果）
+    
+    Args:
+        user_embeddings: 用户嵌入 [batch_size, embed_dim]
+        all_item_embeddings: 所有物品的嵌入 [num_items-1, embed_dim]
+        target_item_ids: 目标物品ID [batch_size]
+        k: 推荐列表长度
+        
+    Returns:
+        hr_list: 每个样本的HR@k
+        ndcg_list: 每个样本的NDCG@k
+    """
+    batch_size = user_embeddings.size(0)
+    
+    # L2归一化
+    user_embeddings = F.normalize(user_embeddings, p=2, dim=1)
+    all_item_embeddings = F.normalize(all_item_embeddings, p=2, dim=1)
+    
+    # 计算余弦相似度
+    scores = torch.matmul(user_embeddings, all_item_embeddings.t())
+    
+    # 排序
+    _, sorted_indices = torch.sort(scores, dim=1, descending=True)
+    
+    hr_list, ndcg_list = [], []
+    
+    for i in range(batch_size):
+        target_id = target_item_ids[i].item()
+        if target_id == 0: 
+            continue
+
+        target_idx = target_id - 1  # ID到索引的转换
+        target_rank_positions = (sorted_indices[i] == target_idx).nonzero(as_tuple=True)[0]
+        
+        hr, ndcg = 0.0, 0.0
+        if len(target_rank_positions) > 0:
+            rank = target_rank_positions[0].item() + 1
+            if rank <= k:
+                hr = 1.0
+                ndcg = 1.0 / np.log2(rank + 1)
+        
+        hr_list.append(hr)
+        ndcg_list.append(ndcg)
+    
+    return hr_list, ndcg_list

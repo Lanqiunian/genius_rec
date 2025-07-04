@@ -3,73 +3,86 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-# --- 1. 数据集准备 (适配Seq2Seq任务) ---
-# 🔧 修复版本：避免数据泄露，正确构造序列分割
 class Seq2SeqRecDataset(Dataset):
-    def __init__(self, config, data_path, split_ratio=0.5):
+    """
+    为GENIUS-Rec模型准备训练和验证数据的数据集。
+    核心逻辑：
+    1. 动态分割：根据真实序列长度和配置中的比例，将用户历史分割为源(source)和目标(target)。
+    2. 固定长度填充：将分割后的序列填充到配置中指定的固定长度，以便进行批处理。
+    3. 注入特殊Token：为解码器的输入添加[SOS]，为标签添加[EOS]。
+    """
+    def __init__(self, config, data_path):
         """
-        初始化数据集
-        
+        初始化数据集。
+
         Args:
-            config: 配置字典，包含所有必要参数
-            data_path: 数据文件路径
-            split_ratio: 编码器/解码器序列分割比例
+            config (dict): 全局配置字典。
+            data_path (str or Path): 数据文件路径 (.parquet格式)。
         """
         self.data = pd.read_parquet(data_path)
+        
+        # --- 从配置中读取所有必要的参数 ---
         self.max_seq_len = config['encoder_model']['max_len']
         self.pad_token_id = config['pad_token_id']
         self.sos_token_id = config['sos_token_id']
         self.eos_token_id = config['eos_token_id']
-        # 分割点，例如0.5表示一半历史用于编码，一半用于解码
-        self.split_point = int(self.max_seq_len * split_ratio)
+        
+        # 【最终优化】读取真正用于序列分割的比例
+        # 这个比例决定了用多少历史(e.g., 80%)去预测多少未来(e.g., 20%)
+        self.sequence_split_ratio = config['finetune'].get('split_ratio', 0.8) # 提供默认值以增加健壮性
+        
+        # 【最终优化】计算编码器和解码器输入最终需要被填充到的固定长度
+        # 这确保了DataLoader输出的每个Tensor形状都一致
+        self.encoder_target_len = int(self.max_seq_len * self.sequence_split_ratio)
+        self.decoder_target_len = self.max_seq_len - self.encoder_target_len
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        # 获取完整的历史序列
+        # 1. 获取一个用户的完整历史序列
         full_seq = self.data.iloc[idx]['history']
         
-        # 截断到最大长度
+        # 2. 截断过长的序列，只保留最近的行为
         if len(full_seq) > self.max_seq_len:
             full_seq = full_seq[-self.max_seq_len:]
         
-        # 🔧 修复：使用时间分割避免数据泄露
-        # 对于推荐任务，应该是历史预测未来，而不是任意分割
+        # 3. 动态分割序列，生成源(source)和目标(target)
         if len(full_seq) <= 2:
-            # 序列太短，跳过或使用最小配置
-            source_seq = [full_seq[0]] if len(full_seq) > 0 else [self.pad_token_id]
-            target_seq = full_seq[1:] if len(full_seq) > 1 else [self.pad_token_id]
+            # 处理极短序列的边缘情况
+            source_seq = [full_seq[0]] if len(full_seq) > 0 else []
+            target_seq = full_seq[1:] if len(full_seq) > 1 else []
         else:
-            # 使用前80%作为编码器输入，后20%作为解码器目标
-            split_idx = max(1, int(len(full_seq) * 0.8))
+            # 使用配置驱动的比例，基于当前序列的真实长度进行分割
+            split_idx = max(1, int(len(full_seq) * self.sequence_split_ratio))
             source_seq = full_seq[:split_idx]
             target_seq = full_seq[split_idx:]
 
-        # 创建带padding的编码器输入
-        source_ids = np.full(self.split_point, self.pad_token_id, dtype=np.int64)
-        if len(source_seq) > 0:
-            copy_len = min(len(source_seq), self.split_point)
-            source_ids[-copy_len:] = source_seq[-copy_len:]  # 右对齐
+        # 4. 创建编码器输入，并进行右对齐填充
+        source_ids = np.full(self.encoder_target_len, self.pad_token_id, dtype=np.int64)
+        if len(source_seq) > 0: # 检查非空
+            # 只复制源序列中最后的部分，如果它比目标长度还长的话
+            copy_len = min(len(source_seq), self.encoder_target_len)
+            source_ids[-copy_len:] = source_seq[-copy_len:]
 
-        # 【关键修正】正确构造解码器输入和标签，支持EOS标记
-        decoder_input_len = self.max_seq_len - self.split_point
-        
-        # 解码器输入：[SOS, target_seq[:-1]]
-        decoder_input_ids = np.full(decoder_input_len, self.pad_token_id, dtype=np.int64)
-        decoder_input_ids[0] = self.sos_token_id  # 开始标记
-        if len(target_seq) > 0:
-            copy_len = min(len(target_seq), decoder_input_len - 1)
+        # 5. 创建解码器输入 (decoder_input_ids)
+        # 格式: [SOS, item1, item2, ..., PAD, PAD]
+        decoder_input_ids = np.full(self.decoder_target_len, self.pad_token_id, dtype=np.int64)
+        decoder_input_ids[0] = self.sos_token_id  # 序列以[SOS]开始
+        if len(target_seq) > 0: # 检查非空
+            copy_len = min(len(target_seq), self.decoder_target_len - 1)
             decoder_input_ids[1:1+copy_len] = target_seq[:copy_len]
 
-        # 解码器标签：[target_seq, EOS, PAD...]
-        labels = np.full(decoder_input_len, self.pad_token_id, dtype=np.int64)
-        if len(target_seq) > 0:
-            copy_len = min(len(target_seq), decoder_input_len - 1)
+        # 6. 创建解码器标签 (labels)
+        # 格式: [item1, item2, item3, ..., EOS, PAD]
+        labels = np.full(self.decoder_target_len, self.pad_token_id, dtype=np.int64)
+        if len(target_seq) > 0: # 检查非空
+            copy_len = min(len(target_seq), self.decoder_target_len - 1)
             labels[:copy_len] = target_seq[:copy_len]
-            # 在序列结束位置添加EOS标记（如果有空间）
-            if copy_len < decoder_input_len:
-                labels[copy_len] = self.eos_token_id
+            # 🔧 修复：确保EOS token位置安全，并且紧跟在实际内容后
+            eos_position = copy_len
+            if eos_position < self.decoder_target_len:
+                labels[eos_position] = self.eos_token_id
         
         return {
             'source_ids': torch.tensor(source_ids, dtype=torch.long),

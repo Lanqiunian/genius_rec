@@ -1,4 +1,22 @@
-# GENIUS-Rec: 下一代生成式推荐系统
+# GENIUS-Rec: Generative Sequential Recommendation with Large Language Models
+
+[![Python 3.9+](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
+[![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/Lanqiunian/genius_rec/blob/main/LICENSE)
+
+## 🎯 项目简介
+
+GENIUS-Rec是一个基于Transformer架构的生成式序列推荐系统，结合了多专家混合架构和多模态嵌入（文本+图像），能够为用户生成个性化的推荐序列。
+
+### 主要特性
+
+- **🔄 生成式架构**: 使用编码器-解码器结构，支持序列到序列的推荐生成
+- **🧠 多专家系统**: 
+  - 行为专家：基于用户历史行为模式
+  - 内容专家：基于物品文本语义信息
+  - 图像专家：基于物品视觉特征
+- **📝 多模态嵌入**: 支持Google Gemini文本嵌入和CLIP图像嵌入
+- **⚡ 高效训练**: 支持GPU加速，内存优化，批处理等推荐系统
 
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)

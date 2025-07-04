@@ -85,9 +85,9 @@ def get_config():
             "label_smoothing": 0, # 标签平滑，防止过拟合
             "warmup_steps": 1000, # 学习率预热步数
             "weight_decay": 0.1,
-            "early_stopping_patience": 5,
+            "early_stopping_patience": 4,
             "num_workers": 10,
-            "split_ratio": 0.5, # 数据集分割比例
+            "split_ratio": 0.6, # 数据集分割比例
             "warmup_epochs": 3, # 预热轮次
         },
         
@@ -134,5 +134,13 @@ def get_config():
             }
         }
     }
+    
+    # 🔧 新增：配置验证
+    special_ids = [config['pad_token_id'], config['sos_token_id'], 
+                   config['eos_token_id'], config['mask_token_id']]
+    if len(set(special_ids)) != len(special_ids):
+        raise ValueError("Special token IDs must be unique!")
+    if config['pad_token_id'] != 0:
+        raise ValueError("pad_token_id must be 0 for PyTorch compatibility!")
     
     return config

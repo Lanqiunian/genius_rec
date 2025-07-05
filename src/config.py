@@ -84,7 +84,7 @@ def get_config():
                 "encoder_lr": 5e-6,  # 保持不变，用于精调
                 "gate_lr": 1e-4      # 门控网络学习率
             },
-            "balancing_loss_alpha": 0.1, # 负载均衡损失的系数
+            "balancing_loss_alpha": 0.4, # 负载均衡损失的系数
             "label_smoothing": 0,
             "warmup_steps": 1000,
             "weight_decay": 0.01,    

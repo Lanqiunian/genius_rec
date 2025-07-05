@@ -82,9 +82,6 @@ def evaluate_model_validation_with_ranking(model, val_loader, criterion, device,
     hr_total, ndcg_total, total_samples = 0.0, 0.0, 0
     total_gate_weights = None
     
-    warmup_epochs = config['finetune'].get('warmup_epochs', 0)
-    force_equal_weights = (epoch < warmup_epochs)
-    
     with torch.no_grad():
         item_num = model.encoder.item_embedding.num_embeddings
         all_item_embeddings = None
@@ -102,7 +99,7 @@ def evaluate_model_validation_with_ranking(model, val_loader, criterion, device,
 
             logits, gate_weights, _ = model(
                 source_ids, decoder_input_ids, source_padding_mask,
-                return_weights=True, force_equal_weights=force_equal_weights
+                return_weights=True
             )
             
             loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))

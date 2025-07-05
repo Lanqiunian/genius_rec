@@ -75,7 +75,7 @@ def test_decoder_forward_pass(decoder):
         with torch.no_grad():
             logits, weights, balancing_loss = decoder(
                 target_ids, encoder_output, memory_padding_mask,
-                return_weights=True, force_equal_weights=False
+                return_weights=True
             )
         
         print(f"✅ 前向传播成功")
@@ -84,15 +84,7 @@ def test_decoder_forward_pass(decoder):
         print(f"  - weights: {weights.shape if weights is not None else 'None'}")
         print(f"  - balancing_loss: {balancing_loss.item():.6f}")
         
-        # 测试等权重模式
-        with torch.no_grad():
-            logits_eq, weights_eq, balancing_loss_eq = decoder(
-                target_ids, encoder_output, memory_padding_mask,
-                return_weights=True, force_equal_weights=True
-            )
-        
-        print(f"✅ 等权重模式成功")
-        print(f"📊 等权重输出:")
+        # 注意：已移除等权重模式测试
         print(f"  - logits: {logits_eq.shape}")
         print(f"  - balancing_loss: {balancing_loss_eq.item():.6f}")
         
@@ -174,7 +166,7 @@ def test_expert_configurations():
             with torch.no_grad():
                 logits, weights, balancing_loss = decoder(
                     target_ids, encoder_output, memory_padding_mask,
-                    return_weights=True, force_equal_weights=False
+                    return_weights=True
                 )
             
             print(f"   前向传播成功: logits {logits.shape}")

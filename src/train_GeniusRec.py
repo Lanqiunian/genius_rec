@@ -33,7 +33,7 @@ from src.decoder.decoder import GenerativeDecoder
 
 
 # # 端到端微调训练（推荐方式）
-# python -m src.train_GeniusRec --encoder_weights_path checkpoints/hstu_encoder.pth
+# python -m src.train_GeniusRec --encoder_weights_path checkpoints/hstu_encoder.pth --full_evaluation
 
 # # 冻结编码器训练（对比实验）
 # python -m src.train_GeniusRec --encoder_weights_path checkpoints/hstu_encoder.pth --freeze_encoder
@@ -669,89 +669,89 @@ def main():
             logging.info(f"✅ 成功恢复训练状态! 从 Epoch {start_epoch} 继续")
             logging.info(f"   - Best Val Loss: {best_val_loss:.4f}")
 
-    # 13. 训练主循环
+ # 13. 训练主循环
     logging.info("=== Starting Training Loop ===")
     warmup_epochs = config['finetune'].get('warmup_epochs', 2)
     for epoch in range(start_epoch, config['finetune']['num_epochs']):
         # 训练一个epoch
         is_warmup_phase = (epoch < warmup_epochs)
         avg_train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, scheduler, 
+            model, train_loader, criterion, optimizer, scheduler,
             device, epoch, config['finetune']['num_epochs'], pad_token_id,
             force_equal_weights=is_warmup_phase, scaler=scaler
         )
-        
-        # 验证集评估（计算loss、ppl和排序指标）
-        # 根据命令行参数决定使用全量评估还是采样评估
+
+        # 验证集评估
         num_candidates = None if (args.full_evaluation or args.sample_eval_size == 0) else args.sample_eval_size
-        
-        # 记录评估模式
         if num_candidates is None:
             logging.info(f"使用全量评估模式 (与HSTU/baseline一致)")
         else:
             logging.info(f"使用采样评估模式，每个用户随机抽取{num_candidates-1}个负样本+1个正样本")
             
         eval_results = evaluate_model_validation_with_ranking(
-            model, val_loader, criterion, device, 
+            model, val_loader, criterion, device,
             epoch, config['finetune']['num_epochs'], pad_token_id,
             num_candidates=num_candidates, top_k=top_k
         )
         
-        # 日志输出
+        # --- 【核心修正】先更新状态，再保存检查点 ---
+
+        # 检查当前验证损失是否是历史最佳
+        current_val_loss = eval_results['val_loss']
+        is_best = current_val_loss < best_val_loss
+
+        if is_best:
+            best_val_loss = current_val_loss
+            patience_counter = 0
+            logging.info(f"🎉 发现新的最佳模型! Val Loss: {best_val_loss:.4f}")
+        else:
+            patience_counter += 1
+        
+        # 准备要保存到检查点中的完整状态信息
+        # 这里的 best_val_loss 和 patience_counter 都是本轮更新后的最新状态
+        checkpoint_metrics = {
+            'best_val_loss': best_val_loss,
+            'patience_counter': patience_counter,
+            **eval_results
+        }
+        
+        # 如果是最佳模型，保存到 best_model_path
+        if is_best:
+            save_checkpoint(
+                best_model_path, model, optimizer, scheduler,
+                epoch, checkpoint_metrics, config, num_items
+            )
+            logging.info(f"已保存最佳模型到: {best_model_path}")
+        
+        # 无论如何，都保存最新的状态到 latest_model_path
+        # 这样可以确保恢复时总是从最正确的状态开始
+        save_checkpoint(
+            latest_model_path, model, optimizer, scheduler,
+            epoch, checkpoint_metrics, config, num_items
+        )
+        logging.info(f"已保存最新检查点到: {latest_model_path}")
+
+        # 日志输出 (移到状态更新之后，逻辑更清晰)
         logging.info(f"Epoch {epoch+1}/{config['finetune']['num_epochs']} Results:")
         logging.info(f"  📈 Train Loss: {avg_train_loss:.4f}")
-        logging.info(f"  📉 Val Loss: {eval_results['val_loss']:.4f}")
+        logging.info(f"  📉 Val Loss: {current_val_loss:.4f} (Best: {best_val_loss:.4f})")
         logging.info(f"  📊 Val PPL: {eval_results['val_ppl']:.4f}")
         logging.info(f"  🎯 Val HR@{top_k}: {eval_results['val_hr']:.4f}")
         logging.info(f"  🎯 Val NDCG@{top_k}: {eval_results['val_ndcg']:.4f}")
-        logging.info(f"  📊 Eval samples: {eval_results['evaluated_samples']}")
         
-        # 动态显示专家权重
         enabled_experts = [k for k, v in config['expert_system']['experts'].items() if v]
         for expert_name in enabled_experts:
             weight_key = f'avg_{expert_name}_weight'
             if weight_key in eval_results:
                 logging.info(f"  ⚖️  {expert_name.replace('_', ' ').title()} Weight: {eval_results[weight_key]:.4f}")
 
-        # 准备保存的指标
-        save_metrics = {
-            'best_val_loss': best_val_loss,
-            'patience_counter': patience_counter,
-            **eval_results
-        }
-
-        # 保存最新检查点
-        save_checkpoint(
-            latest_model_path, model, optimizer, scheduler, 
-            epoch, save_metrics, config, num_items
-        )
-        logging.info(f"保存最新检查点到: {latest_model_path}")
-
-        # 🆕 可选：使用NDCG作为模型选择标准（注释掉原来的loss标准）
-        # if eval_results['val_ndcg'] > best_val_ndcg:  # 🆕 基于NDCG选择最佳模型
-        #     best_val_ndcg = eval_results['val_ndcg']
-        
-        # 🔄 保持原来的loss标准（推荐）
-        if eval_results['val_loss'] < best_val_loss:
-            best_val_loss = eval_results['val_loss']
-            patience_counter = 0
-            save_metrics['best_val_loss'] = best_val_loss
-            
-            save_checkpoint(
-                best_model_path, model, optimizer, scheduler, 
-                epoch, save_metrics, config, num_items
-            )
-            logging.info(f"🎉 发现新的最佳模型! Val Loss: {best_val_loss:.4f}")
-        else:
-            patience_counter += 1
-
         # 早停检查
         early_stopping_patience = config['finetune'].get('early_stopping_patience', 10)
+        logging.info(f"耐心计数: {patience_counter}/{early_stopping_patience}")
         if patience_counter >= early_stopping_patience:
             logging.info(f"触发早停! 连续 {patience_counter} 个epoch性能未提升")
             break
             
-        logging.info(f"耐心计数: {patience_counter}/{early_stopping_patience}")
         logging.info("-" * 80)
 
     # 14. 训练完成，在测试集上进行最终评估

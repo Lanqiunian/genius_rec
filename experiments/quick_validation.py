@@ -92,12 +92,26 @@ class QuickExperimentRunner:
                     if "training finished" in output and "Average Loss" in output:
                         self.logger.info(f"[Epoch完成] {output.strip()}")
             
-            # 等待进程结束并获取返回码
-            return_code = process.wait(timeout=max_time)
-            duration = time.time() - start_time
+        if return_code == 0:
+            self.logger.info(f"✅ 快速实验 {name} 成功完成 (用时: {duration:.1f}s)")
             
-            # 合并所有捕获的输出
-            full_output = '\n'.join(captured_output)
+            # 解析结果
+            metrics = self.parse_metrics_from_output(full_output)
+            
+            return {
+                "status": "success",
+                "duration": duration,
+                "metrics": metrics,
+                "args": args
+            }
+        else:
+            self.logger.error(f"❌ 快速实验 {name} 失败")
+            return {
+                "status": "failed", 
+                "duration": duration,
+                "return_code": return_code,
+                "output": full_output[-1000:] if full_output else "No output captured"
+            }
             
             if return_code == 0:
                 self.logger.info(f"✅ {name} 完成 (用时: {duration:.1f}秒)")
@@ -151,6 +165,32 @@ class QuickExperimentRunner:
         
         return metrics
     
+    def parse_metrics_from_output(self, output: str) -> dict:
+        """从训练输出解析关键指标"""
+        metrics = {}
+        lines = output.split('\n')
+        
+        for line in lines:
+            # 解析HR和NDCG指标
+            if "Test HR@10:" in line:
+                try:
+                    metrics["test_hr"] = float(line.split(":")[1].strip())
+                except:
+                    pass
+            if "Test NDCG@10:" in line:
+                try:
+                    metrics["test_ndcg"] = float(line.split(":")[1].strip())
+                except:
+                    pass
+            # 解析验证损失
+            if "Best validation loss:" in line:
+                try:
+                    metrics["best_val_loss"] = float(line.split(":")[1].strip())
+                except:
+                    pass
+        
+        return metrics
+
     def _parse_metrics_from_checkpoint(self, checkpoint_dir: str) -> dict:
         """从保存的checkpoint文件中读取指标"""
         import torch
@@ -198,11 +238,11 @@ class QuickExperimentRunner:
             # 加入内容专家
             ("behavior_plus_content", ["--disable_image_expert"]),  # 行为+内容
             
-            # 加入图像专家
-            ("behavior_plus_image", ["--disable_content_expert"]),  # 行为+图像（图像专家默认启用）
+            # 加入图像专家  
+            ("behavior_plus_image", ["--disable_content_expert", "--enable_image_expert"]),  # 行为+图像
             
             # 全专家配置
-            ("all_experts", []),  # 默认配置就是全专家
+            ("all_experts", ["--enable_image_expert"]),  # 启用所有专家
         ]
         
         for name, args in experiments:

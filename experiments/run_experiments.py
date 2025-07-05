@@ -159,15 +159,15 @@ class ExperimentRunner:
         lines = output.split('\n')
         
         for line in lines:
-            # 解析测试结果
-            if "Test HR@" in line:
+            # 解析测试结果 - 适配当前输出格式
+            if "Test HR@10:" in line:
                 try:
                     hr_value = float(line.split(":")[1].strip())
                     metrics["test_hr"] = hr_value
                 except:
                     pass
                     
-            if "Test NDCG@" in line:
+            if "Test NDCG@10:" in line:
                 try:
                     ndcg_value = float(line.split(":")[1].strip())
                     metrics["test_ndcg"] = ndcg_value
@@ -175,12 +175,16 @@ class ExperimentRunner:
                     pass
                     
             # 解析验证结果
-            if "Best Val Loss:" in line:
+            if "Best validation loss:" in line:
                 try:
                     val_loss = float(line.split(":")[1].strip())
                     metrics["best_val_loss"] = val_loss
                 except:
                     pass
+                    
+            # 解析训练完成标志
+            if "training finished" in line.lower():
+                metrics["training_completed"] = True
         
         return metrics
 
@@ -190,20 +194,20 @@ class ExperimentRunner:
         
         expert_configs = [
             # 单专家实验
-            ("behavior_only", ["--disable_content_expert"]),
-            ("content_only", ["--disable_behavior_expert"]), 
+            ("behavior_only", ["--disable_content_expert", "--disable_image_expert"]),
+            ("content_only", ["--disable_behavior_expert", "--disable_image_expert"]), 
             ("image_only", ["--disable_behavior_expert", "--disable_content_expert", "--enable_image_expert"]),
             
             # 双专家实验
-            ("behavior_content", []),  # 默认配置
+            ("behavior_content", ["--disable_image_expert"]),  # 行为+内容专家
             ("behavior_image", ["--disable_content_expert", "--enable_image_expert"]),
             ("content_image", ["--disable_behavior_expert", "--enable_image_expert"]),
             
             # 全专家实验
             ("all_experts", ["--enable_image_expert"]),
             
-            # 无专家基线（仅行为专家，相当于传统方法）
-            ("no_experts", ["--disable_content_expert"]),
+            # 传统基线（仅行为专家）
+            ("baseline_traditional", ["--disable_content_expert", "--disable_image_expert"]),
         ]
         
         results = {}
@@ -279,10 +283,10 @@ class ExperimentRunner:
         """数据增强效果实验"""
         self.logger.info("📚 开始数据增强效果实验")
         
-        # 测试图像嵌入的效果
+        # 测试图像嵌入的效果 - 使用正确的路径
         data_configs = [
-            ("no_image_embeddings", []),  # 不使用图像嵌入
-            ("with_image_embeddings", ["--enable_image_expert", "--image_embeddings_path", "data/book_image_embeddings.npy"]),
+            ("no_image_embeddings", ["--disable_image_expert"]),  # 禁用图像专家
+            ("with_image_embeddings", ["--enable_image_expert"]),  # 启用图像专家，使用配置中的默认路径
         ]
         
         results = {}

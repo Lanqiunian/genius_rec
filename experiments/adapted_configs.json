@@ -1,0 +1,77 @@
+{
+  "core_ablation": [
+    {
+      "name": "baseline_behavior_only",
+      "description": "\u4ec5\u884c\u4e3a\u4e13\u5bb6\uff08\u4f20\u7edf\u63a8\u8350\u57fa\u7ebf\uff09",
+      "args": [
+        "--disable_content_expert",
+        "--disable_image_expert"
+      ],
+      "expected_experts": [
+        "behavior_expert"
+      ]
+    },
+    {
+      "name": "behavior_plus_content",
+      "description": "\u884c\u4e3a\u4e13\u5bb6 + \u5185\u5bb9\u4e13\u5bb6",
+      "args": [
+        "--disable_image_expert"
+      ],
+      "expected_experts": [
+        "behavior_expert",
+        "content_expert"
+      ]
+    },
+    {
+      "name": "behavior_plus_image",
+      "description": "\u884c\u4e3a\u4e13\u5bb6 + \u56fe\u50cf\u4e13\u5bb6",
+      "args": [
+        "--disable_content_expert",
+        "--enable_image_expert"
+      ],
+      "expected_experts": [
+        "behavior_expert",
+        "image_expert"
+      ]
+    },
+    {
+      "name": "all_experts",
+      "description": "\u5168\u4e13\u5bb6\u7cfb\u7edf",
+      "args": [
+        "--enable_image_expert"
+      ],
+      "expected_experts": [
+        "behavior_expert",
+        "content_expert",
+        "image_expert"
+      ]
+    }
+  ],
+  "architecture_tests": [
+    {
+      "name": "frozen_encoder",
+      "description": "\u51bb\u7ed3\u7f16\u7801\u5668\u6d4b\u8bd5",
+      "args": [
+        "--freeze_encoder",
+        "--enable_image_expert"
+      ],
+      "expected_experts": [
+        "behavior_expert",
+        "content_expert",
+        "image_expert"
+      ]
+    },
+    {
+      "name": "finetuned_encoder",
+      "description": "\u7aef\u5230\u7aef\u5fae\u8c03\u6d4b\u8bd5",
+      "args": [
+        "--enable_image_expert"
+      ],
+      "expected_experts": [
+        "behavior_expert",
+        "content_expert",
+        "image_expert"
+      ]
+    }
+  ]
+}

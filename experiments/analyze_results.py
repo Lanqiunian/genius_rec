@@ -27,17 +27,60 @@ class ExperimentAnalyzer:
         sns.set_palette("husl")
         
     def load_experiment_results(self, results_file: str = None):
-        """加载实验结果"""
+        """加载实验结果 - 支持多种格式"""
         if results_file is None:
             # 自动找到最新的结果文件
             result_files = list(self.results_dir.glob("experiment_results_*.json"))
-            if not result_files:
+            log_files = list(self.results_dir.glob("experiment_log_*.txt"))
+            
+            if result_files:
+                results_file = str(max(result_files, key=lambda x: x.stat().st_mtime))
+            elif log_files:
+                # 如果没有JSON文件，尝试解析日志文件
+                return self.parse_log_results(str(max(log_files, key=lambda x: x.stat().st_mtime)))
+            else:
                 print("❌ 未找到实验结果文件")
                 return None
-            results_file = str(max(result_files, key=lambda x: x.stat().st_mtime))
         
-        with open(results_file, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        try:
+            with open(results_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"❌ 加载结果文件失败: {e}")
+            return None
+    
+    def parse_log_results(self, log_file: str):
+        """从日志文件解析实验结果"""
+        print(f"📋 从日志文件解析结果: {log_file}")
+        results = {}
+        
+        with open(log_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # 简单的日志解析逻辑
+        lines = content.split('\n')
+        current_exp = None
+        
+        for line in lines:
+            if "开始实验:" in line:
+                current_exp = line.split("开始实验:")[-1].strip()
+                results[current_exp] = {"status": "running", "metrics": {}}
+            elif "实验" in line and "成功完成" in line and current_exp:
+                results[current_exp]["status"] = "success"
+            elif "Test HR@10:" in line and current_exp:
+                try:
+                    hr_value = float(line.split(":")[1].strip())
+                    results[current_exp]["metrics"]["test_hr"] = hr_value
+                except:
+                    pass
+            elif "Test NDCG@10:" in line and current_exp:
+                try:
+                    ndcg_value = float(line.split(":")[1].strip())
+                    results[current_exp]["metrics"]["test_ndcg"] = ndcg_value
+                except:
+                    pass
+        
+        return results
     
     def analyze_expert_ablation(self, results: dict):
         """分析专家系统消融实验结果"""

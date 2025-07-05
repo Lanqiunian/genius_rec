@@ -74,23 +74,27 @@ def get_config():
         },
         
         # --- 阶段二: Encoder-Decoder 微调配置 ---
+  # --- 修正后的微调配置 ---
         "finetune": {
             "log_file": "finetune_genius_rec.log",
-            "num_epochs": 50, # 微调通常不需要太多轮次
-            "batch_size": 64, # 由于模型更大，可能需要减小batch_size
+            "num_epochs": 50,
+            "batch_size": 32,
             "learning_rate": {
-                "decoder_lr": 1e-3, # 解码器使用较大的学习率
-                "encoder_lr": 5e-6, # 编码器使用更小的学习率
+                "decoder_lr": 1e-4,  # 解码器学习率
+                "encoder_lr": 5e-6,  # 保持不变，用于精调
+                "gate_lr": 1e-4      # 门控网络学习率
             },
-            "label_smoothing": 0, # 标签平滑，防止过拟合
-            "warmup_steps": 1000, # 学习率预热步数
-            "weight_decay": 0.1,
+            "balancing_loss_alpha": 0.4, # 负载均衡损失的系数
+            "label_smoothing": 0,
+            "warmup_steps": 1000,
+            "weight_decay": 0.01,    
             "early_stopping_patience": 4,
             "num_workers": 10,
-            "split_ratio": 0.6, # 数据集分割比例
-            "warmup_epochs": 3, # 预热轮次
+            # "warmup_epochs": 0,   
+            "split_ratio": 0.6,
+              
         },
-        
+                
         # =================================================================
         # 4. 评估参数 (Evaluation Config)
         # =================================================================
@@ -121,6 +125,7 @@ def get_config():
                 "attention_heads": 4,        # 交叉注意力头数
                 "use_cross_attention": True, # 是否使用交叉注意力
                 "text_embedding_dim": 768,   # 文本嵌入维度
+                "trainable_embeddings": True 
             },
             
             # 图像专家配置
@@ -131,6 +136,7 @@ def get_config():
                 "image_encoder": "clip",     # 图像编码器类型
                 "use_adaptive_pooling": True, # 使用自适应池化适配不同维度
                 "visual_attention_dropout": 0.1, # 视觉注意力dropout
+                "trainable_embeddings": True
             }
         }
     }

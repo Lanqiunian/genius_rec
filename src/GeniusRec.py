@@ -1,34 +1,23 @@
-# src/GeniusRec.py
-
 import torch
 import torch.nn as nn
-# 确保导入正确的类
-from src.encoder.encoder import Hstu      
-from src.decoder.decoder import GenerativeDecoder 
+from src.encoder.encoder import Hstu
+from src.decoder.decoder import GenerativeDecoder
 
 class GENIUSRecModel(nn.Module):
     def __init__(self, encoder_config, decoder_config, expert_config=None):
         """
-        初始化GENIUS-Rec模型
-        
-        Args:
-            encoder_config: 编码器配置字典
-            decoder_config: 解码器配置字典
-            expert_config: 专家系统配置字典
+        【最终版】初始化GENIUS-Rec模型
         """
         super().__init__()
         
-        # 初始化编码器
         self.encoder = Hstu(**encoder_config)
         
-        # 将专家配置传递给解码器
         decoder_config_with_expert = decoder_config.copy()
         if expert_config:
             decoder_config_with_expert['expert_config'] = expert_config
             
         self.decoder = GenerativeDecoder(**decoder_config_with_expert)
         
-        # 🔧 修复：添加维度匹配检查和投影层
         encoder_dim = encoder_config['embedding_dim']
         decoder_dim = decoder_config['embedding_dim']
         
@@ -38,23 +27,21 @@ class GENIUSRecModel(nn.Module):
         else:
             self.encoder_projection = None
 
-    def forward(self, source_ids, target_ids, source_padding_mask, 
-                force_equal_weights: bool = False, 
-                return_weights: bool = False):
-        
+    def forward(self, source_ids, target_ids, source_padding_mask, return_weights: bool = False):
+        """
+        【最终版】模型的前向传播。
+        拥有一个简洁的接口，正确传递参数和返回值。
+        """
         encoder_output = self.encoder(source_ids)
         
-        # 🔧 修复：处理维度不匹配
         if self.encoder_projection is not None:
             encoder_output = self.encoder_projection(encoder_output)
         
-        # 将参数一路传递给解码器, 并直接返回解码器的输出
+        # 直接调用解码器，并返回其所有的输出
+        # 解码器会返回 (final_logits, weights, balancing_loss)
         return self.decoder(
-            target_ids=target_ids, 
-            encoder_output=encoder_output, 
+            target_ids=target_ids,
+            encoder_output=encoder_output,
             memory_padding_mask=source_padding_mask,
-            force_equal_weights=force_equal_weights, 
-            return_weights=return_weights,
-            # 显式传递 is_training
-            is_training=self.training 
+            return_weights=return_weights
         )

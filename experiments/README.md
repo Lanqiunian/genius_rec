@@ -20,15 +20,32 @@
 # 推荐的实验流程
 cd /root/autodl-tmp/genius_rec-main
 
-# 1. 快速验证环境和基本功能
-python start_experiments.py --mode quick
+# 1. 首先验证解码器架构兼容性
+python experiments/test_decoder_architecture.py
 
-# 2. 运行核心消融实验
-python start_experiments.py --mode expert
+# 2. 运行系统兼容性检查
+python experiments/adapter.py
 
-# 3. 分析实验结果  
-python experiments/analyze_results.py
+# 3. 快速验证核心功能（推荐首次运行）
+python experiments/main_experiment_controller.py --suite quick
+
+# 4. 深入专家消融研究
+python experiments/main_experiment_controller.py --suite ablation
+
+# 5. 完整实验套件
+python experiments/main_experiment_controller.py --suite full
+
+# 6. 结果分析
+python experiments/main_experiment_controller.py --suite analysis
 ```
+
+## 当前架构状态
+
+✅ **多专家MoE解码器**: 支持行为、内容、图像三类专家
+✅ **动态专家权重**: 基于门控网络的动态权重分配
+✅ **负载均衡**: 防止专家极化的平衡损失机制
+✅ **交叉注意力**: 内容和图像专家使用编码器-解码器交叉注意力
+✅ **可训练嵌入**: 支持专家嵌入的可训练/冻结模式
 
 ## 研究假设与实验设计
 

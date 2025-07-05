@@ -1,0 +1,12 @@
+{
+  "timestamp": "2025-07-05T18:36:01.918450",
+  "checks": {
+    "\u89e3\u7801\u5668\u517c\u5bb9\u6027": "\u2705 \u901a\u8fc7",
+    "\u4e13\u5bb6\u7cfb\u7edf\u914d\u7f6e": "\u2705 \u901a\u8fc7",
+    "\u5b9e\u9a8c\u914d\u7f6e\u751f\u6210": "\u2705 \u901a\u8fc7"
+  },
+  "decoder_status": "compatible",
+  "recommendations": [
+    "\u7cfb\u7edf\u517c\u5bb9\u6027\u826f\u597d\uff0c\u53ef\u4ee5\u5f00\u59cb\u5b9e\u9a8c"
+  ]
+}

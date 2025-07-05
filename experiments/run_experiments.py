@@ -42,8 +42,12 @@ from typing import Dict, List, Any
 import itertools
 
 class ExperimentRunner:
-    def __init__(self, base_dir: str = "/root/autodl-tmp/genius_rec-main"):
-        self.base_dir = Path(base_dir)
+    def __init__(self, base_dir: str = None):
+        # 如果没有指定base_dir，使用当前工作目录
+        if base_dir is None:
+            self.base_dir = Path.cwd()
+        else:
+            self.base_dir = Path(base_dir)
         self.experiment_dir = self.base_dir / "experiments"
         self.experiment_dir.mkdir(exist_ok=True)
         
@@ -73,7 +77,9 @@ class ExperimentRunner:
         """运行单个实验"""
         if save_dir is None:
             save_dir = f"experiments/checkpoints/{exp_name}"
-            
+        # 确保保存目录存在
+        (self.base_dir / save_dir).mkdir(parents=True, exist_ok=True)
+        
         # 构建完整命令
         cmd = self.base_cmd + [
             "--encoder_weights_path", self.encoder_weights,
@@ -166,22 +172,19 @@ class ExperimentRunner:
                     metrics["test_hr"] = hr_value
                 except:
                     pass
-                    
             if "Test NDCG@10:" in line:
                 try:
                     ndcg_value = float(line.split(":")[1].strip())
                     metrics["test_ndcg"] = ndcg_value
                 except:
                     pass
-                    
             # 解析验证结果
-            if "Best validation loss:" in line:
+            if "Best validation loss:" in line or "Best Val Loss:" in line:
                 try:
                     val_loss = float(line.split(":")[1].strip())
                     metrics["best_val_loss"] = val_loss
                 except:
                     pass
-                    
             # 解析训练完成标志
             if "training finished" in line.lower():
                 metrics["training_completed"] = True
@@ -232,10 +235,9 @@ class ExperimentRunner:
             # 编码器冻结 vs 微调
             ("finetuned_encoder", []),  # 默认微调编码器
             ("frozen_encoder", ["--freeze_encoder"]),  # 冻结编码器
-            
-            # 不同的解码器层数（需要通过环境变量或配置文件修改）
-            ("deep_decoder", []),  # 可以通过配置调整
-            ("shallow_decoder", []),
+            # 不同的解码器层数
+            ("deep_decoder", ["--decoder_layers", "8"]),  # 深解码器
+            ("shallow_decoder", ["--decoder_layers", "2"]),  # 浅解码器
         ]
         
         results = {}
@@ -449,7 +451,7 @@ def main():
         default="expert_ablation",
         help="选择要运行的实验套件"
     )
-    parser.add_argument("--base_dir", type=str, default="/root/autodl-tmp/genius_rec-main", help="项目根目录")
+    parser.add_argument("--base_dir", type=str, default=None, help="项目根目录(默认使用当前目录)")
     
     args = parser.parse_args()
     

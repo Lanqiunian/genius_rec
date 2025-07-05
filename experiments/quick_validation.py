@@ -44,101 +44,54 @@ class QuickExperimentRunner:
         self.results = {}
         
     def run_quick_experiment(self, name: str, args: list, max_time: int = 1800):
-        """运行单个快速实验（30分钟超时）"""
-        
+        """运行单个快速实验（默认30分钟超时）"""
+        # 设置保存目录
+        save_dir = Path("experiments/quick_checkpoints") / name
+        save_dir.mkdir(parents=True, exist_ok=True)
         cmd = [
             "python", "-m", "src.train_GeniusRec",
             "--encoder_weights_path", "checkpoints/hstu_encoder.pth",
-            "--save_dir", f"experiments/quick_checkpoints/{name}"
-            ] + args
-        
+            "--save_dir", str(save_dir)
+        ] + args
         self.logger.info(f"🚀 开始快速实验: {name}")
         self.logger.info(f"📋 命令: {' '.join(cmd)}")
-        self.logger.info("📈 训练进度将实时显示...")
-        
         start_time = time.time()
         captured_output = []
-        
         try:
-            # 🔧 使用Popen实现实时输出+捕获
             process = subprocess.Popen(
                 cmd,
-                cwd=self.base_dir,
+                cwd=Path.cwd(),
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,  # 合并stderr到stdout
+                stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1,  # 行缓冲
+                bufsize=1,
                 universal_newlines=True
             )
-            
-            # 实时读取并显示输出，同时保存到captured_output
+            # 实时读取输出
             while True:
-                output = process.stdout.readline()
-                if output == '' and process.poll() is not None:
+                line = process.stdout.readline()
+                if line == '' and process.poll() is not None:
                     break
-                if output:
-                    print(output.strip())  # 实时显示到终端
-                    captured_output.append(output.strip())  # 同时捕获
-                    
-                    # 🔧 修复：只记录关键信息，避免进度条刷屏
-                    if any(keyword in output for keyword in [
-                        "Starting Training", "开始训练", "训练完成", "training finished",
-                        "Best Val Loss", "HR@", "NDCG@", "实验", "loading", "加载",
-                        "✅", "❌", "⚠️"
-                    ]):
-                        self.logger.info(f"[训练输出] {output.strip()}")
-                        
-                    # 🔧 修复：只记录每10个epoch的完整进度，避免每个batch都记录
-                    if "training finished" in output and "Average Loss" in output:
-                        self.logger.info(f"[Epoch完成] {output.strip()}")
-            
-        if return_code == 0:
-            self.logger.info(f"✅ 快速实验 {name} 成功完成 (用时: {duration:.1f}s)")
-            
-            # 解析结果
-            metrics = self.parse_metrics_from_output(full_output)
-            
-            return {
-                "status": "success",
-                "duration": duration,
-                "metrics": metrics,
-                "args": args
-            }
-        else:
-            self.logger.error(f"❌ 快速实验 {name} 失败")
-            return {
-                "status": "failed", 
-                "duration": duration,
-                "return_code": return_code,
-                "output": full_output[-1000:] if full_output else "No output captured"
-            }
-            
+                if line:
+                    line_str = line.strip()
+                    print(line_str)
+                    captured_output.append(line_str)
+            return_code = process.wait(timeout=max_time)
+            duration = time.time() - start_time
+            full_output = '\n'.join(captured_output)
             if return_code == 0:
-                self.logger.info(f"✅ {name} 完成 (用时: {duration:.1f}秒)")
-                
-                # 从捕获的输出中解析指标
-                metrics = self._parse_final_metrics(full_output)
-                
-                # 如果输出中没有指标，尝试从checkpoint读取
-                if not metrics:
-                    checkpoint_metrics = self._parse_metrics_from_checkpoint(f"experiments/quick_checkpoints/{name}")
-                    metrics.update(checkpoint_metrics)
-                
-                return {
-                    "status": "success",
-                    "duration": duration,
-                    "metrics": metrics
-                }
+                self.logger.info(f"✅ 快速实验 {name} 成功 (用时: {duration:.1f}s)")
+                metrics = self.parse_metrics_from_output(full_output)
+                return {"status": "success", "duration": duration, "metrics": metrics, "args": args}
             else:
-                self.logger.error(f"❌ {name} 失败，返回码: {return_code}")
-                return {"status": "failed", "return_code": return_code}
-                
+                self.logger.error(f"❌ 快速实验 {name} 失败 (返回码: {return_code})")
+                return {"status": "failed", "duration": duration, "return_code": return_code}
         except subprocess.TimeoutExpired:
-            self.logger.warning(f"⏰ {name} 超时，终止进程")
+            self.logger.error(f"⏰ 快速实验 {name} 超时 ({max_time}s) 并被终止")
             process.kill()
-            return {"status": "timeout"}
+            return {"status": "timeout", "duration": max_time}
         except Exception as e:
-            self.logger.error(f"💥 {name} 异常: {e}")
+            self.logger.error(f"💥 快速实验 {name} 异常: {e}")
             return {"status": "error", "error": str(e)}
     
     def _parse_final_metrics(self, output: str) -> dict:
@@ -434,4 +387,16 @@ def main():
     runner.run_all_quick_experiments()
 
 if __name__ == "__main__":
-    main()
+    runner = QuickExperimentRunner()
+    quick_configs = [
+        ("quick_behavior_only", ["--disable_content_expert"]),
+        ("quick_all_experts", ["--enable_image_expert"])
+    ]
+    all_results = {}
+    for cfg_name, cfg_args in quick_configs:
+        all_results[cfg_name] = runner.run_quick_experiment(cfg_name, cfg_args)
+    # 保存结果
+    result_file = runner.results_dir / "quick_results.json"
+    with open(result_file, 'w', encoding='utf-8') as f:
+        json.dump(all_results, f, indent=2, ensure_ascii=False)
+    runner.logger.info(f"📄 快速实验结果已保存到: {result_file}")

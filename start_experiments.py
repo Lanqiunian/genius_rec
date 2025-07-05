@@ -84,7 +84,8 @@ def check_prerequisites():
     """检查实验前提条件"""
     print("\n🔍 检查实验前提条件...")
     
-    base_dir = Path("/root/autodl-tmp/genius_rec-main")
+    # 使用当前工作目录而不是硬编码路径
+    base_dir = Path.cwd()
     
     # 检查必要文件
     required_files = [
@@ -111,10 +112,21 @@ def check_prerequisites():
         return False
     
     # 检查图像嵌入（可选）
-    image_embeddings = base_dir / "data/book_image_embeddings.npy"
-    if image_embeddings.exists():
-        print("✅ 找到图像嵌入文件，可以测试视觉专家")
-    else:
+    image_embedding_candidates = [
+        "data/book_image_embeddings_migrated.npy",
+        "data/book_image_embeddings.npy",
+        "data/book_gemini_embeddings_filtered.npy"
+    ]
+    
+    found_image_embeddings = False
+    for candidate in image_embedding_candidates:
+        image_embeddings = base_dir / candidate
+        if image_embeddings.exists():
+            print(f"✅ 找到图像嵌入文件: {candidate}")
+            found_image_embeddings = True
+            break
+    
+    if not found_image_embeddings:
         print("⚠️  未找到图像嵌入文件，视觉专家将被禁用")
     
     print("✅ 前提条件检查通过")
@@ -168,7 +180,7 @@ def run_experiment(mode: str):
         print("⏱️ 实验开始，请耐心等待...\n")
         
         # 运行实验
-        result = subprocess.run(cmd, cwd="/root/autodl-tmp/genius_rec-main")
+        result = subprocess.run(cmd, cwd=Path.cwd())
         
         if result.returncode == 0:
             print("\n🎉 实验成功完成!")

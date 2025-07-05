@@ -54,7 +54,7 @@ class RecDataset(data.Dataset):
             negative_samples = []
             while len(negative_samples) < self.num_neg_samples:
                 # 修复：负采样应该跳过所有特殊标记(0,1,2,3)，从4开始
-                neg_candidate = np.random.randint(4, self.item_num)
+                neg_candidate = np.random.randint(4, self.item_num + 4)
                 if neg_candidate != positive_item and neg_candidate not in item_seq:
                     negative_samples.append(neg_candidate)
             

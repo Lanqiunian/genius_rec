@@ -78,7 +78,7 @@ def get_config():
         "finetune": {
             "log_file": "finetune_genius_rec.log",
             "num_epochs": 50,
-            "batch_size": 32,
+            "batch_size": 16,
             "learning_rate": {
                 "decoder_lr": 1e-4,  # 解码器学习率
                 "encoder_lr": 5e-6,  # 保持不变，用于精调

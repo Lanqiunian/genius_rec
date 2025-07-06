@@ -152,21 +152,21 @@ def test_validation():
         model.eval()
         logger.info("🔍 模型设置为评估模式")
         
-        # 测试验证功能
+        # 测试验证功能 - 直接复制训练脚本的全量评估逻辑
         logger.info("🧪 开始测试验证功能...")
         
-        # 创建损失函数 (来自train_GeniusRec.py)
+        # 创建损失函数 (来自train_GeniusRec.py line 530)
         import torch.nn as nn
-        criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id)
+        criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id, label_smoothing=config['finetune'].get('label_smoothing', 0))
         
-        # 使用更多样本进行测试，不要限制太少
-        sample_eval_size = 1000  # 增加到1000个样本
+        # 使用全量评估，直接对齐训练脚本 (来自train_GeniusRec.py line 560-567)
+        num_candidates = None  # 全量评估，不限制候选数量
         
         try:
             eval_results = evaluate_model_validation_with_ranking(
-                model, val_loader, criterion, device,  # 正确传递criterion
-                0, 1, pad_token_id,  # epoch, num_epochs, pad_token_id
-                config=config, num_candidates=sample_eval_size, top_k=top_k
+                model, val_loader, criterion, device,
+                0, 1, pad_token_id,  # epoch=0, num_epochs=1
+                config=config, num_candidates=num_candidates, top_k=top_k
             )
             
             logger.info("🎉 验证功能测试成功！")

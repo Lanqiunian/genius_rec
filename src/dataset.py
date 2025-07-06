@@ -58,12 +58,12 @@ class Seq2SeqRecDataset(Dataset):
             source_seq = full_seq[:split_idx]
             target_seq = full_seq[split_idx:]
 
-        # 4. 创建编码器输入，并进行右对齐填充
+        # 4. 创建编码器输入，并进行左对齐填充 (关键修正)
         source_ids = np.full(self.encoder_target_len, self.pad_token_id, dtype=np.int64)
-        if len(source_seq) > 0: # 检查非空
-            # 只复制源序列中最后的部分，如果它比目标长度还长的话
+        if len(source_seq) > 0:
+            # 从左侧开始填充真实序列
             copy_len = min(len(source_seq), self.encoder_target_len)
-            source_ids[-copy_len:] = source_seq[-copy_len:]
+            source_ids[:copy_len] = source_seq[:copy_len]
 
         # 5. 创建解码器输入 (decoder_input_ids)
         # 格式: [SOS, item1, item2, ..., PAD, PAD]

@@ -216,6 +216,7 @@ def main():
     parser.add_argument('--image_embeddings_path', type=str, default=None, help='Path to image embeddings file.')
     parser.add_argument('--full_evaluation', action='store_true', help='使用全量评估(与所有物品计算相似度)，与HSTU和baseline完全一致，但速度较慢。')
     parser.add_argument('--sample_eval_size', type=int, default=500, help='采样评估的候选物品数量，默认为500，设为0使用全量评估。')
+    parser.add_argument('--decoder_layers', type=int, default=None, help='Override decoder layers count for architecture experiments.')
     args = parser.parse_args()
 
     config = get_config()
@@ -224,6 +225,11 @@ def main():
     if args.disable_content_expert: config['expert_system']['experts']['content_expert'] = False
     if args.disable_image_expert: config['expert_system']['experts']['image_expert'] = False
     if args.enable_image_expert: config['expert_system']['experts']['image_expert'] = True
+    
+    # Override decoder layers if specified
+    if args.decoder_layers is not None:
+        config['decoder_model']['num_layers'] = args.decoder_layers
+        logging.info(f"🏗️ 覆盖解码器层数设置为: {args.decoder_layers}")
 
     # 2. 环境设置
     device = torch.device(config['device'])

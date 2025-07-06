@@ -25,7 +25,7 @@ import logging
 
 class QuickExperimentRunner:
     def __init__(self):
-        self.base_dir = Path("/root/autodl-tmp/genius_rec-main")
+        self.base_dir = Path.cwd()  # 使用当前工作目录而非硬编码路径
         self.results_dir = self.base_dir / "experiments" / "quick_results"
         self.results_dir.mkdir(parents=True, exist_ok=True)
         

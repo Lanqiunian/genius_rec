@@ -37,9 +37,9 @@ def get_config():
         # =================================================================
         "encoder_model": {
             "max_len": 50,
-            "embedding_dim": 64,
-            "linear_hidden_dim": 16, # dv
-            "attention_dim": 16,     # dqk
+            "embedding_dim": 64,         # 建议: 128 或 256
+            "linear_hidden_dim": 16,     # dv, 建议: 32 或 64
+            "attention_dim": 16,         # dqk, 建议: 32 或 64
             "num_layers": 4,
             "num_heads": 4,
             "dropout": 0.1,
@@ -47,12 +47,12 @@ def get_config():
         },
 
         "decoder_model": {
-            "max_seq_len": 50, # 解码器也需要知道最大长度
-            "embedding_dim": 64, # 维度通常与编码器保持一致
-            "num_layers": 4,     # 解码器层数，可以与编码器不同
+            "max_seq_len": 50,
+            "embedding_dim": 64,         # 建议: 128 或 256
+            "num_layers": 4,
             "num_heads": 4,
-            "ffn_hidden_dim": 64 * 4, # 前馈网络隐藏层维度，通常是embedding_dim的4倍
-            "dropout_ratio": 0.3,
+            "ffn_hidden_dim": 64 * 4,    # 建议随 embedding_dim 调整, e.g., 128 * 4
+            "dropout_ratio": 0.3,        # 建议: 0.1 或 0.2
              # num_items 在训练脚本中动态传入
         },
 
@@ -74,17 +74,16 @@ def get_config():
         },
         
         # --- 阶段二: Encoder-Decoder 微调配置 ---
-  # --- 修正后的微调配置 ---
-        "finetune": {
+  "finetune": {
             "log_file": "finetune_genius_rec.log",
             "num_epochs": 50,
             "batch_size": 16,
             "learning_rate": {
-                "decoder_lr": 1e-4,  # 解码器学习率
+                "decoder_lr": 1e-3,  # 解码器学习率, 建议: 3e-4 或 1e-4
                 "encoder_lr": 5e-6,  # 保持不变，用于精调
                 "gate_lr": 1e-4      # 门控网络学习率
             },
-            "balancing_loss_alpha": 0.4, # 负载均衡损失的系数
+            "balancing_loss_alpha": 0.3, # 负载均衡损失的系数, 建议: 0.01 或 0.05
             "label_smoothing": 0,
             "warmup_steps": 1000,
             "weight_decay": 0.01,    
@@ -125,7 +124,7 @@ def get_config():
                 "attention_heads": 4,        # 交叉注意力头数
                 "use_cross_attention": True, # 是否使用交叉注意力
                 "text_embedding_dim": 768,   # 文本嵌入维度
-                "trainable_embeddings": True 
+                "trainable_embeddings": False 
             },
             
             # 图像专家配置
@@ -136,7 +135,7 @@ def get_config():
                 "image_encoder": "clip",     # 图像编码器类型
                 "use_adaptive_pooling": True, # 使用自适应池化适配不同维度
                 "visual_attention_dropout": 0.1, # 视觉注意力dropout
-                "trainable_embeddings": True
+                "trainable_embeddings": False
             }
         }
     }

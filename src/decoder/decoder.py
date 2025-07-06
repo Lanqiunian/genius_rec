@@ -191,14 +191,13 @@ class GenerativeDecoder(nn.Module):
             balancing_loss = len(self.enabled_experts) * torch.sum(avg_probs_per_expert.pow(2))
 
         # 3. 💡 **核心修正**: 初始化 final_logits 并使用新的 `expert_weights` 变量
-        final_logits = torch.zeros_like(hidden_state @ self.item_embedding.weight.t()) # 确保形状正确
+        final_logits = torch.zeros(batch_size, target_len, self.num_items, device=target_ids.device)
         expert_idx = 0
 
         if self.expert_config["experts"].get("behavior_expert", False):
             behavior_logits = self.behavior_expert_fc(hidden_state)
-            # 直接使用 expert_weights，不再有 'expanded'
             weight = expert_weights[:, :, expert_idx].unsqueeze(-1)
-            final_logits = weight * behavior_logits
+            final_logits += weight * behavior_logits
             expert_idx += 1
 
         if self.expert_config["experts"].get("content_expert", False):

@@ -78,7 +78,7 @@ class ExperimentAdapter:
             with torch.no_grad():
                 logits, weights, balancing_loss = decoder(
                     target_ids, encoder_output, memory_padding_mask,
-                    return_weights=True, force_equal_weights=True
+                    return_weights=True
                 )
             
             self.logger.info(f"✅ 前向传播测试成功 - logits shape: {logits.shape}")

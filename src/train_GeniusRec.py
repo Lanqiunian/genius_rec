@@ -59,9 +59,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
     total_loss_value = 0.0
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Training]", leave=True)
 
-    warmup_epochs = config['finetune'].get('warmup_epochs', 0)
     balancing_loss_alpha = config['finetune'].get('balancing_loss_alpha', 0.01)
-    force_equal_weights = (epoch < warmup_epochs)
 
     for batch_idx, batch in enumerate(progress_bar):
         source_ids = batch['source_ids'].to(device)
@@ -82,12 +80,8 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
             
             task_loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
             
-            if not force_equal_weights:
-                loss = task_loss + balancing_loss_alpha * balancing_loss
-                bal_loss_item = balancing_loss.item()
-            else:
-                loss = task_loss
-                bal_loss_item = 0.0
+            loss = task_loss + balancing_loss_alpha * balancing_loss
+            bal_loss_item = balancing_loss.item()
 
         if scaler is not None:
             scaler.scale(loss).backward()

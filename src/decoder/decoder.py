@@ -75,7 +75,6 @@ class GenerativeDecoder(nn.Module):
     【最终版】生成式解码器
     - 增加了对 trainable_embeddings 的配置支持
     - 实现了负载均衡损失以防止专家极化
-    - 实现了 force_equal_weights 用于预热
     """
     def __init__(self, num_items: int, embedding_dim: int, num_layers: int, num_heads: int,
                  ffn_hidden_dim: int, max_seq_len: int, dropout_ratio: float = 0.1,
@@ -165,7 +164,7 @@ class GenerativeDecoder(nn.Module):
         return mask
 
     def forward(self, target_ids: torch.Tensor, encoder_output: torch.Tensor, memory_padding_mask: torch.Tensor,
-                return_weights: bool = False, force_equal_weights: bool = False):
+                return_weights: bool = False):
         
         batch_size, target_len = target_ids.size()
         positions = torch.arange(0, target_len, device=target_ids.device).unsqueeze(0)
@@ -178,22 +177,15 @@ class GenerativeDecoder(nn.Module):
         for layer in self.decoder_layers:
             hidden_state = layer(hidden_state, encoder_output, target_mask, memory_padding_mask)
 
-        # 1. 动态计算专家权重 (这部分逻辑现在是正确的)
-        if force_equal_weights:
-            equal_weight = 1.0 / len(self.enabled_experts)
-            base_weights = torch.full((batch_size, 1, len(self.enabled_experts)), 
-                                    equal_weight, 
-                                    device=hidden_state.device)
-            expert_weights = base_weights.expand(-1, target_len, -1)
-        else:
-            gate_input = hidden_state
-            gate_logits = self.gate_network(gate_input.view(-1, self.embedding_dim))
-            gate_logits = gate_logits.view(batch_size, target_len, -1)
-            expert_weights = F.softmax(gate_logits, dim=-1) # Shape: [B, T, num_experts]
+        # 1. 动态计算专家权重
+        gate_input = hidden_state
+        gate_logits = self.gate_network(gate_input.view(-1, self.embedding_dim))
+        gate_logits = gate_logits.view(batch_size, target_len, -1)
+        expert_weights = F.softmax(gate_logits, dim=-1) # Shape: [B, T, num_experts]
 
         # 2. 计算平衡损失 (balancing_loss)
         balancing_loss = torch.tensor(0.0, device=target_ids.device)
-        if self.training and not force_equal_weights:
+        if self.training:
             # 使用更标准的 .mean(dim=(0, 1))
             avg_probs_per_expert = expert_weights.mean(dim=(0, 1))
             balancing_loss = len(self.enabled_experts) * torch.sum(avg_probs_per_expert.pow(2))

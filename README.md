@@ -22,7 +22,7 @@ GENIUS-Rec是一个基于Transformer架构的生成式序列推荐系统，结�
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 [![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/Lanqiunian/genius_rec/blob/main/LICENSE)
 
-**GENIUS-Rec** 是一个旨在突破传统推荐范式局限的开源研究项目。它不仅仅预测用户可能点击的“下一个物品”，而是致力于成为一个能够理解用户多模态兴趣，并直接**生成一个连贯、高质量推荐会话（Session）**的AI智能顾问。
+**GENIUS-Rec** 是一个旨在突破传统推荐范式局限的开源研究项目。它不仅仅预测用户可能点击的“下一个物品”，而是致力于成为一个能够理解用户多模态兴趣，并直接生成一个连贯、高质量推荐会话的推荐系统。
 
 ---
 
@@ -32,7 +32,7 @@ GENIUS-Rec是一个基于Transformer架构的生成式序列推荐系统，结�
 1.  **语义鸿沟**: 传统模型难以理解物品（如书籍、电影）的深层文本和视觉内涵。
 2.  **范式局限**: “单点预测”无法满足用户对连贯、探索式体验的需求。
 
-为实现此目标，GENIUS-Rec采用了一个标准的**Encoder-Decoder（编码器-解码器）**架构：
+为实现此目标，GENIUS-Rec采用了一个标准的Encoder-Decoder（编码器-解码器）架构：
 
 * **编码器 (Encoder)**: 为了追求极致的序列理解能力，完整复现并预训练了Meta AI提出的SOTA模型 **HSTU (Hierarchical Sequential Transduction Unit)**，使其能深度编码用户的行为历史。
 * **解码器 (Decoder)**: 在编码器提供的用户理解之上，构建了一个标准的**生成式Transformer解码器**,融入MoE，负责自回归地生成推荐序列。

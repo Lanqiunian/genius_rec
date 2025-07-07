@@ -113,7 +113,18 @@ class GenerativeDecoder(nn.Module):
             self.image_expert_projection = nn.Linear(embedding_dim, embedding_dim)
             self.register_buffer('image_embedding_matrix', torch.zeros(1, 1))
 
-        self.gate_network = nn.Linear(embedding_dim, num_experts)
+        # 门控网络配置
+        if self.expert_config.get("gate_config", {}).get("gate_type") == "mlp":
+            gate_hidden_dim = self.expert_config["gate_config"].get("gate_hidden_dim", 64)
+            self.gate_network = nn.Sequential(
+                nn.Linear(embedding_dim, gate_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(gate_hidden_dim, num_experts)
+            )
+        elif self.expert_config.get("gate_config", {}).get("gate_type") == "simple":
+            self.gate_network = nn.Linear(embedding_dim, num_experts)
+
+
         self.final_projection = nn.Linear(embedding_dim, num_items)
 
     def load_text_embeddings(self, embedding_matrix: torch.Tensor, verbose: bool = True):

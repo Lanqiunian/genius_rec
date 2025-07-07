@@ -516,6 +516,8 @@ def main():
     main_param_ids = {id(p) for p_group in [gate_params, encoder_params, embedding_params] for p in p_group}
     main_model_params = [p for p in model.parameters() if id(p) not in main_param_ids and p.requires_grad]
 
+    model.decoder.final_projection.weight = model.encoder.item_embedding.weight
+    
     optimizer = torch.optim.AdamW([
         {'params': main_model_params, 'lr': config['finetune']['learning_rate']['decoder_lr']},
         {'params': gate_params, 'lr': config['finetune']['learning_rate']['gate_lr']},
@@ -552,6 +554,9 @@ def main():
             best_val_loss = resume_info['best_val_loss']
             patience_counter = resume_info['patience_counter']
             logging.info(f"✅ 成功恢复训练状态! 从 Epoch {start_epoch} 继续 (Best Val Loss: {best_val_loss:.4f})")
+
+
+
 
     # 13. 训练主循环 (最终版)
     logging.info("=== Starting Training Loop ===")

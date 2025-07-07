@@ -82,7 +82,7 @@ def get_config():
                 "encoder_lr": 5e-6,  # 保持不变，用于精调
                 "gate_lr": 1e-4      # 门控网络学习率
             },
-            "balancing_loss_alpha": 0.1, # 负载均衡损失的系数, 建议: 0.01 或 0.05
+            "balancing_loss_alpha": 0.5, # 负载均衡损失的系数, 建议: 0.01 或 0.05
             "label_smoothing": 0,
             "warmup_steps": 1000,
             "weight_decay": 0.01,    
@@ -103,7 +103,7 @@ def get_config():
         },
         
         # =================================================================
-        # 5. 专家系统配置 (Expert System Config) 【新增】
+        # 5. 专家系统配置 (Expert System Config) 
         # =================================================================
         "expert_system": {
             # 专家启用开关
@@ -115,7 +115,7 @@ def get_config():
             
             # 门控网络配置
             "gate_config": {
-                "gate_type": "simple",       # 门控类型：'simple'(原始), 'mlp'(新增)
+                "gate_type": "mlp",       # 门控类型：'simple'(原始), 'mlp'(新增)
                 "gate_hidden_dim": 64,       # MLP门控的隐藏层维度（仅gate_type='mlp'时使用）
                 "temperature": 1.0,          # softmax温度参数（预留）
             },

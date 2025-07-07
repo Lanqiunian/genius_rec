@@ -73,110 +73,101 @@ def evaluate_model_validation(model, val_loader, criterion, device, pad_token_id
     
     return {'val_loss': avg_loss, 'val_ppl': perplexity}
 
+
 def evaluate_model_validation_with_ranking(model, val_loader, criterion, device, epoch, num_epochs, pad_token_id, config, top_k=10, **kwargs):
     """
-    【最终优化版】验证集评估：同时计算loss, ppl, 和排序指标。
-    此版本完全向量化，通过并行矩阵运算来计算排序指标，以实现最高评估效率。
+    【最终修复版】验证集评估：同时计算loss, ppl, 和排序指标。
+    - 适配“前缀预测后缀”模式，使用编码器对历史前缀的输出来代表用户。
+    - 评估目标为后缀的第一个真实物品。
+    - 彻底解决数据泄露和所有已知bug。
     """
     model.eval()
     total_loss_tokens, total_tokens = 0.0, 0
     hr_total, ndcg_total, total_samples = 0.0, 0.0, 0
     
-    # --- For MoE expert weight analysis ---
-    total_gate_weights = None
-    total_valid_batches = 0
+    total_gate_weights, total_valid_batches = None, 0
     enabled_experts = [k for k, v in config['expert_system']['experts'].items() if v]
     num_special_tokens = config['num_special_tokens']
 
     with torch.no_grad():
-        # Pre-fetch all item embeddings for efficient similarity calculation
         item_num = model.encoder.item_embedding.num_embeddings
         all_item_embeddings = model.encoder.item_embedding.weight[num_special_tokens:item_num]
 
         progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Validation]", leave=False)
 
         for batch in progress_bar:
-            # --- Data Preparation ---
+            # --- 数据准备 ---
             source_ids = batch['source_ids'].to(device)
+            decoder_input_ids = batch['decoder_input_ids'].to(device)
             labels = batch['labels'].to(device)
-            padding_mask = (source_ids == pad_token_id)
+            source_padding_mask = (source_ids == pad_token_id)
             batch_size = source_ids.size(0)
 
-            # --- Model Forward Pass ---
-            logits, gate_weights, balancing_loss = model(
-                input_ids=source_ids,
-                padding_mask=padding_mask,
+            # --- Loss 计算 (基于解码器) ---
+            # 为了计算loss，依然需要完整运行一次模型
+            logits, gate_weights, _, _ = model(
+                source_ids=source_ids,
+                decoder_input_ids=decoder_input_ids,
+                source_padding_mask=source_padding_mask,
                 return_weights=True
             )
-            
-            # --- Loss and Perplexity Calculation ---
             task_loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
-            non_padding_mask = (labels != pad_token_id)
-            num_tokens = non_padding_mask.sum().item()
-
+            non_padding_mask_labels = (labels != pad_token_id)
+            num_tokens = non_padding_mask_labels.sum().item()
             if num_tokens > 0:
                 total_loss_tokens += task_loss.item() * num_tokens
                 total_tokens += num_tokens
             
-            # --- Expert Weight Aggregation (for analysis) ---
+            # --- 专家权重聚合 ---
             if gate_weights is not None:
-                label_mask = non_padding_mask.float().unsqueeze(-1)
+                non_padding_mask_decoder = (decoder_input_ids != pad_token_id)
+                label_mask = non_padding_mask_decoder.float().unsqueeze(-1)
                 valid_gate_weights = gate_weights * label_mask
                 batch_sum = valid_gate_weights.sum(dim=(0, 1))
                 batch_count = label_mask.sum()
                 if batch_count > 0:
                     batch_mean = batch_sum / batch_count
-                    if total_gate_weights is None:
-                        total_gate_weights = batch_mean
-                    else:
-                        total_gate_weights += batch_mean
+                    if total_gate_weights is None: total_gate_weights = batch_mean
+                    else: total_gate_weights += batch_mean
                     total_valid_batches += 1
 
-            # --- Ranking Metrics Calculation (Fully Vectorized) ---
-            # 1. Get user embeddings from the last position of the encoder output
+            # --- 【核心修复】正确的排序指标计算逻辑 ---
+            
+            # 1. 获取用户画像：只将历史前缀(source_ids)送入编码器
             encoder_outputs = model.encoder(source_ids)
-            user_embeddings = encoder_outputs[:, -1, :]
+            
+            # 使用历史前缀的最后一个非填充token的表征作为用户画像
+            source_lengths = (source_ids != pad_token_id).sum(dim=1)
+            embedding_dim = model.encoder.item_embedding.embedding_dim
+            last_item_indices = (source_lengths - 1).view(-1, 1, 1).expand(-1, -1, embedding_dim)
+            user_embeddings = encoder_outputs.gather(1, last_item_indices).squeeze(1)
 
-            # 2. Extract the first valid label for each sequence in the batch as the ground truth
-            # This is a highly efficient way to replace a for-loop
-            first_label_indices = torch.argmax((labels != pad_token_id).int(), dim=1)
-            target_item_ids = labels.gather(1, first_label_indices.unsqueeze(1)).squeeze(1)
-
-            # 3. Call the fully vectorized metric computation function
+            # 2. 获取评估目标：目标是未来后缀的第一个物品
+            #    它在labels张量的第0个位置
+            target_item_ids = labels[:, 0]
+            
+            # 3. 调用指标函数
             hr, ndcg = compute_hr_ndcg_full(
-                user_embeddings, 
-                all_item_embeddings, 
-                target_item_ids, 
-                k=top_k, 
-                special_token_offset=num_special_tokens
+                user_embeddings, all_item_embeddings, target_item_ids, 
+                k=top_k, special_token_offset=num_special_tokens
             )
 
-            # Aggregate results, using the actual batch size for averaging
+            # --- 结果聚合 ---
             if hr is not None and ndcg is not None:
                  hr_total += hr * batch_size
                  ndcg_total += ndcg * batch_size
                  total_samples += batch_size
-
             progress_bar.set_postfix(
-                loss=(task_loss.item() if num_tokens > 0 else 0.0), 
-                hr=f"{hr:.4f}", 
-                ndcg=f"{ndcg:.4f}"
+                loss=(task_loss.item() if num_tokens > 0 else 0.0), hr=f"{hr:.4f}", ndcg=f"{ndcg:.4f}"
             )
 
-    # --- Final Metrics Calculation ---
+    # --- 最终指标计算 ---
     avg_loss = total_loss_tokens / total_tokens if total_tokens > 0 else 0
     perplexity = math.exp(avg_loss) if avg_loss > 0 and avg_loss < 20 else float('inf')
     avg_hr = hr_total / total_samples if total_samples > 0 else 0.0
     avg_ndcg = ndcg_total / total_samples if total_samples > 0 else 0.0
     
-    # --- Prepare result dictionary ---
-    result = {
-        'val_loss': avg_loss, 
-        'val_ppl': perplexity, 
-        'val_hr': avg_hr, 
-        'val_ndcg': avg_ndcg,
-        'evaluated_samples': total_samples
-    }
+    result = { 'val_loss': avg_loss, 'val_ppl': perplexity, 'val_hr': avg_hr, 'val_ndcg': avg_ndcg }
     
     if total_gate_weights is not None and total_valid_batches > 0:
         avg_gate_weights = total_gate_weights / total_valid_batches
@@ -185,7 +176,6 @@ def evaluate_model_validation_with_ranking(model, val_loader, criterion, device,
                 result[f'avg_{expert_name}_weight'] = avg_gate_weights[i].item()
 
     return result
-
 
 def evaluate_model_test(model, test_loader, device, item_num, top_k=10, config=None):
     """

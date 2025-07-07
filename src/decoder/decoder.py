@@ -72,60 +72,87 @@ class DecoderBlock(nn.Module):
 
 class GenerativeDecoder(nn.Module):
     """
-    【最终性能优化版】生成式解码器
-    - 采用“后期投影”MoE架构，极大提升训练速度。
-    - 专家在隐藏空间工作，只在最后进行一次到词汇表的投影。
+    【最终修复与优化版】生成式解码器
+    - 修正了交叉注意力的共享逻辑，确保所有专家正确参与训练。
+    - 保留了“后期投影”MoE架构以保证训练速度。
+    - 增加了门控噪声选项，以解决专家极化问题。
     """
     def __init__(self, num_items: int, embedding_dim: int, num_layers: int, num_heads: int,
-                 ffn_hidden_dim: int, max_seq_len: int, dropout_ratio: float = 0.1,
-                 pad_token_id: int = 0, text_embedding_dim: int = 768,
-                 expert_config: dict = None, **kwargs):
-        super(GenerativeDecoder, self).__init__()
+                    ffn_hidden_dim: int, max_seq_len: int, dropout_ratio: float = 0.1,
+                    pad_token_id: int = 0, text_embedding_dim: int = 768,
+                    expert_config: dict = None, **kwargs):
+            super(GenerativeDecoder, self).__init__()
 
-        self.item_embedding = nn.Embedding(num_items, embedding_dim, padding_idx=pad_token_id)
-        self.pos_embedding = nn.Embedding(max_seq_len, embedding_dim)
-        self.decoder_layers = nn.ModuleList(
-            [DecoderBlock(embedding_dim, num_heads, ffn_hidden_dim, dropout_ratio) for _ in range(num_layers)]
-        )
-        self.dropout = nn.Dropout(dropout_ratio)
-        self.embedding_dim = embedding_dim
-        self.num_items = num_items
-        
-        self.expert_config = expert_config or {"experts": {}}
-        self.enabled_experts = [k for k, v in self.expert_config["experts"].items() if v]
-        num_experts = len(self.enabled_experts)
-        if num_experts == 0: raise ValueError("At least one expert must be enabled!")
-        print(f"🧠 [Optimized] Enabled Experts: {self.enabled_experts} (Total: {num_experts})")
-
-        # Experts now output to embedding_dim
-        if "behavior_expert" in self.enabled_experts:
-            self.behavior_expert = nn.Linear(embedding_dim, embedding_dim)
-
-        if "content_expert" in self.enabled_experts:
-            content_config = self.expert_config["content_expert"]
-            self.content_expert_attention = nn.MultiheadAttention(embedding_dim, content_config["attention_heads"], dropout=dropout_ratio, batch_first=True)
-            self.content_expert_projection = nn.Linear(embedding_dim, embedding_dim)
-            self.register_buffer('text_embedding_matrix', torch.zeros(1, 1))
-
-        if "image_expert" in self.enabled_experts:
-            image_config = self.expert_config["image_expert"]
-            self.image_expert_attention = nn.MultiheadAttention(embedding_dim, image_config["attention_heads"], dropout=dropout_ratio, batch_first=True)
-            self.image_expert_projection = nn.Linear(embedding_dim, embedding_dim)
-            self.register_buffer('image_embedding_matrix', torch.zeros(1, 1))
-
-        # 门控网络配置
-        if self.expert_config.get("gate_config", {}).get("gate_type") == "mlp":
-            gate_hidden_dim = self.expert_config["gate_config"].get("gate_hidden_dim", 64)
-            self.gate_network = nn.Sequential(
-                nn.Linear(embedding_dim, gate_hidden_dim),
-                nn.ReLU(),
-                nn.Linear(gate_hidden_dim, num_experts)
+            self.item_embedding = nn.Embedding(num_items, embedding_dim, padding_idx=pad_token_id)
+            self.pos_embedding = nn.Embedding(max_seq_len, embedding_dim)
+            self.decoder_layers = nn.ModuleList(
+                [DecoderBlock(embedding_dim, num_heads, ffn_hidden_dim, dropout_ratio) for _ in range(num_layers)]
             )
-        elif self.expert_config.get("gate_config", {}).get("gate_type") == "simple":
-            self.gate_network = nn.Linear(embedding_dim, num_experts)
+            self.dropout = nn.Dropout(dropout_ratio)
+            self.embedding_dim = embedding_dim
+            self.num_items = num_items
+            
+            self.expert_config = expert_config or {"experts": {}}
+            self.enabled_experts = [k for k, v in self.expert_config["experts"].items() if v]
+            num_experts = len(self.enabled_experts)
+            if num_experts == 0: raise ValueError("At least one expert must be enabled!")
+            print(f"🧠 [Final Version] Enabled Experts: {self.enabled_experts} (Total: {num_experts})")
 
+            # --- 【核心修改】创建一个辅助函数来动态构建投影层 ---
+            def create_projection_layer(expert_name, config):
+                projection_type = config.get(f"{expert_name}_projection_type", "simple")
+                if projection_type == "mlp":
+                    print(f"  - {expert_name.replace('_', ' ').title()} Projection: MLP (with Dropout)")
+                    return nn.Sequential(
+                        nn.Linear(embedding_dim, embedding_dim * 2),
+                        nn.ReLU(),
+                        nn.Dropout(dropout_ratio),
+                        nn.Linear(embedding_dim * 2, embedding_dim)
+                    )
+                else:
+                    print(f"  - {expert_name.replace('_', ' ').title()} Projection: Simple (Linear Layer)")
+                    return nn.Linear(embedding_dim, embedding_dim)
+            
+            # --- 共享交叉注意力模块 (逻辑不变) ---
+            self.shared_cross_attention = None
+            if "content_expert" in self.enabled_experts or "image_expert" in self.enabled_experts:
+                attention_heads = self.expert_config.get("content_expert", {}).get("attention_heads", num_heads)
+                self.shared_cross_attention = nn.MultiheadAttention(embedding_dim, attention_heads, dropout=dropout_ratio, batch_first=True)
+                print(f"✅ Shared Cross-Attention module created for multimodal experts.")
 
-        self.final_projection = nn.Linear(embedding_dim, num_items)
+            # --- 专家网络定义 (使用新的辅助函数) ---
+            if "behavior_expert" in self.enabled_experts:
+                self.behavior_expert = nn.Linear(embedding_dim, embedding_dim)
+
+            if "content_expert" in self.enabled_experts:
+                content_config = self.expert_config["content_expert"]
+                self.content_expert_projection = create_projection_layer("text", content_config)
+                self.register_buffer('text_embedding_matrix', torch.zeros(1, 1))
+
+            if "image_expert" in self.enabled_experts:
+                image_config = self.expert_config["image_expert"]
+                self.image_expert_projection = create_projection_layer("image", image_config)
+                self.register_buffer('image_embedding_matrix', torch.zeros(1, 1))
+
+            # --- 门控网络和最终输出层 (逻辑不变) ---
+            gate_config = self.expert_config.get("gate_config", {})
+            gate_type = gate_config.get("gate_type", "simple")
+            self.gate_noise_epsilon = gate_config.get("noise_epsilon", 0.1)
+
+            if gate_type == "mlp":
+                gate_hidden_dim = gate_config.get("gate_hidden_dim", 64)
+                self.gate_network = nn.Sequential(
+                    nn.Linear(embedding_dim, gate_hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout_ratio),
+                    nn.Linear(gate_hidden_dim, num_experts)
+                )
+                print("🚪 Gating Network Type: MLP (with Dropout for regularization)")
+            else:
+                self.gate_network = nn.Linear(embedding_dim, num_experts)
+                print("🚪 Gating Network Type: Simple (Single Linear Layer)")
+            
+            self.final_projection = nn.Linear(embedding_dim, num_items)
 
     def load_text_embeddings(self, embedding_matrix: torch.Tensor, verbose: bool = True):
         if verbose: print("📄 Loading pre-trained text embeddings...")
@@ -157,32 +184,42 @@ class GenerativeDecoder(nn.Module):
         for layer in self.decoder_layers:
             hidden_state = layer(hidden_state, encoder_output, target_mask, memory_padding_mask)
 
+        # 1. 门控网络计算
         gate_logits = self.gate_network(hidden_state)
+        # --- 【核心修复 3/3】仅在训练时加入门控噪声，对抗专家极化 ---
+        if self.training and self.gate_noise_epsilon > 0:
+            noise = torch.randn_like(gate_logits) * self.gate_noise_epsilon
+            gate_logits += noise
         expert_weights = F.softmax(gate_logits, dim=-1).unsqueeze(-1)
 
+        # 2. 平衡损失计算
         balancing_loss = torch.tensor(0.0, device=target_ids.device)
         if self.training:
             avg_probs_per_expert = expert_weights.squeeze(-1).mean(dim=(0, 1))
             balancing_loss = len(self.enabled_experts) * torch.sum(avg_probs_per_expert.pow(2))
 
+        # 3. 共享的交叉注意力计算
         cross_attention_context = None
-        if "content_expert" in self.enabled_experts or "image_expert" in self.enabled_experts:
-            cross_attention_context, _ = self.content_expert_attention(
+        if self.shared_cross_attention is not None:
+            cross_attention_context, _ = self.shared_cross_attention(
                 query=hidden_state, key=encoder_output, value=encoder_output, key_padding_mask=memory_padding_mask
             )
 
+        # 4. 在隐藏空间中计算专家输出
         expert_outputs = []
         if "behavior_expert" in self.enabled_experts:
             expert_outputs.append(self.behavior_expert(hidden_state))
-        if "content_expert" in self.enabled_experts:
+        if "content_expert" in self.enabled_experts and cross_attention_context is not None:
             expert_outputs.append(self.content_expert_projection(cross_attention_context))
-        if "image_expert" in self.enabled_experts:
+        if "image_expert" in self.enabled_experts and cross_attention_context is not None:
             expert_outputs.append(self.image_expert_projection(cross_attention_context))
         
+        # 5. 加权融合
         stacked_expert_outputs = torch.stack(expert_outputs, dim=2)
         final_hidden_state = (expert_weights * stacked_expert_outputs).sum(dim=2)
         
+        # 6. 最终投影
         final_logits = self.final_projection(final_hidden_state)
 
         weights_to_return = expert_weights.squeeze(-1) if return_weights else None
-        return final_logits, weights_to_return, balancing_loss
+        return final_logits, weights_to_return, balancing_loss, final_hidden_state

@@ -80,9 +80,10 @@ def get_config():
             "learning_rate": {
                 "decoder_lr": 1e-4,  # 解码器学习率, 建议: 3e-4 或 1e-4
                 "encoder_lr": 5e-6,  # 保持不变，用于精调
+                "embedding_lr": 1e-4, # 嵌入层学习率, 建议: 1e-4 或 3e-4
                 "gate_lr": 1e-4      # 门控网络学习率
             },
-            "balancing_loss_alpha": 0.5, # 负载均衡损失的系数, 建议: 0.01 或 0.05
+            "balancing_loss_alpha": 0.1, # 负载均衡损失的系数, 建议: 0.01 或 0.05
             "label_smoothing": 0,
             "warmup_steps": 1000,
             "weight_decay": 0.01,    
@@ -118,12 +119,14 @@ def get_config():
                 "gate_type": "mlp",       # 门控类型：'simple'(原始), 'mlp'(新增)
                 "gate_hidden_dim": 64,       # MLP门控的隐藏层维度（仅gate_type='mlp'时使用）
                 "temperature": 1.0,          # softmax温度参数（预留）
+                "noise_epsilon": 0.8,         # 门控网络噪声参数，用于对抗专家极化
             },
             
             # 内容专家配置
             "content_expert": {
                 "attention_heads": 4,        # 交叉注意力头数
                 "use_cross_attention": True, # 是否使用交叉注意力
+                "text_projection_type": "mlp",     # 文本投影类型：'simple'（原始）, 'mlp'
                 "text_embedding_dim": 768,   # 文本嵌入维度
                 "trainable_embeddings": False 
             },
@@ -135,7 +138,7 @@ def get_config():
                 "image_embedding_dim": 512,  # 图像嵌入维度（CLIP ViT-B/32）
                 "image_encoder": "clip",     # 图像编码器类型
                 "use_adaptive_pooling": True, # 使用自适应池化适配不同维度
-                "visual_attention_dropout": 0.1, # 视觉注意力dropout
+                "image_projection_type": "mlp", # 图像投影类型：'simple', 'mlp'
                 "trainable_embeddings": False
             }
         }

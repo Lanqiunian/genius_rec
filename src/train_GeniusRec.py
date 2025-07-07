@@ -53,7 +53,8 @@ from src.decoder.decoder import GenerativeDecoder
 
 def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, epoch, num_epochs, pad_token_id, config, scaler=None):
     """
-    【最终重构版】训练一个epoch，完全适配全程Next-Token Prediction模式。
+    【最终修复版】训练一个epoch。
+    - 适配“随机分割的前缀预测后缀”数据模式，彻底杜绝数据泄露。
     """
     model.train()
     total_loss_value = 0.0
@@ -62,30 +63,28 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
     balancing_loss_alpha = config['finetune'].get('balancing_loss_alpha', 0.01)
 
     for batch_idx, batch in enumerate(progress_bar):
-        # --- 【核心修改 1/3】数据解包和掩码生成 ---
-        # 在新模式下，我们只需要统一的输入和对应的标签。
-        # 'source_ids' 和 'decoder_input_ids' 在新Dataset中是相同的，我们统一称为 input_ids。
-        input_ids = batch['source_ids'].to(device)
+        # --- 【核心修复】解包分离的 source 和 target ---
+        source_ids = batch['source_ids'].to(device)
+        decoder_input_ids = batch['decoder_input_ids'].to(device)
         labels = batch['labels'].to(device)
-        padding_mask = (input_ids == pad_token_id) # 掩码基于统一的输入生成
+        
+        # 掩码现在基于source_ids生成，用于编码器的交叉注意力
+        source_padding_mask = (source_ids == pad_token_id)
 
         optimizer.zero_grad()
 
         with torch.amp.autocast('cuda', enabled=(scaler is not None)):
-            # --- 【核心修改 2/3】调用模型的新接口 ---
-            # 不再区分source和decoder输入，直接传入统一的input_ids。
-            logits, gate_weights, balancing_loss = model(
-                input_ids=input_ids,
-                padding_mask=padding_mask,
+            # --- 【核心修复】调用严格分离source和target的模型接口 ---
+            logits, gate_weights, balancing_loss, _ = model(
+                source_ids=source_ids,
+                decoder_input_ids=decoder_input_ids,
+                source_padding_mask=source_padding_mask,
                 return_weights=True,
             )
             
-            # --- 【核心修改 3/3】损失计算 (逻辑不变，但上下文更清晰) ---
-            # 这里的逻辑完全无需改动，它已经完美适配Next-Token Prediction。
-            # 它会计算模型在序列每个位置的输出(logits)与真实下一个token(labels)之间的损失。
+            # --- 损失计算 (逻辑不变) ---
             task_loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
             
-            # 如果启用了平衡损失，则将其加入总损失
             if balancing_loss is not None:
                 loss = task_loss + balancing_loss_alpha * balancing_loss
                 bal_loss_item = balancing_loss.item()
@@ -93,7 +92,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
                 loss = task_loss
                 bal_loss_item = 0.0
 
-        # --- 后续的优化器和梯度裁剪逻辑完全保持不变 ---
+        # --- 优化器和梯度裁剪 (逻辑不变) ---
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -110,7 +109,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
         
         total_loss_value += loss.item()
         
-        # --- 日志记录部分保持不变 ---
+        # --- 日志记录 (逻辑不变) ---
         if gate_weights is not None:
             enabled_experts = [k for k, v in model.decoder.expert_config["experts"].items() if v]
             weights_postfix = {}
@@ -334,33 +333,46 @@ def main():
         logging.info(f"   - 总容量: {memory_total:.2f}GB")
         logging.info(f"   - 剩余可用: {memory_total - memory_reserved:.2f}GB")
     
-    # 7. 预训练权重加载（优先使用迁移后的权重）
-    if args.encoder_weights_path:
-        try:
-            # 检查是否为迁移后的权重文件
-            weights_path = Path(args.encoder_weights_path)
-            
+   # 7. 断点续传与预训练权重加载的逻辑 (最终修复版)
+    # 步骤 A: 优先尝试从完整检查点恢复训练
+    start_epoch, best_val_loss, patience_counter = 0, float('inf'), 0
+    resumed_from_checkpoint = False  # 新增一个标志位，判断是否成功从检查点恢复
+    latest_model_path = config['data']['checkpoint_dir'] / 'genius_rec_moe_latest.pth'
+    resume_path = args.resume_from or latest_model_path
+    if os.path.exists(resume_path):
+        logging.info(f"发现检查点文件: {resume_path}，尝试恢复...")
+        resume_info = load_checkpoint(resume_path, model, optimizer, scheduler, device)
+        if resume_info:
+            start_epoch = resume_info['epoch'] + 1
+            best_val_loss = resume_info['best_val_loss']
+            patience_counter = resume_info['patience_counter']
+            resumed_from_checkpoint = True
+            logging.info(f"✅ 成功从检查点恢复训练! 将从 Epoch {start_epoch} 继续。")
 
-            
-            checkpoint = torch.load(weights_path , map_location=device, weights_only=False)
+    # 步骤 B: 仅在"冷启动"（即没有从检查点恢复）时，才加载独立的预训练编码器权重
+    if not resumed_from_checkpoint and args.encoder_weights_path:
+        logging.info(f"▶️ 冷启动模式：正在从 '{args.encoder_weights_path}' 加载预训练编码器...")
+        try:
+            weights_path = Path(args.encoder_weights_path)
+            checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
             
             # 处理不同的checkpoint格式
             if 'model_state_dict' in checkpoint:
                 encoder_state_dict = checkpoint['model_state_dict']
-                logging.info("Found 'model_state_dict' in checkpoint")
+                logging.info("   - 格式 'model_state_dict' 已识别。")
             else:
                 encoder_state_dict = checkpoint
-                logging.info("Using checkpoint directly as state_dict")
+                logging.info("   - 直接将文件作为 state_dict 使用。")
             
             # 处理item_num不匹配问题
             current_item_embedding_size = model.encoder.item_embedding.weight.shape
             checkpoint_item_embedding_size = encoder_state_dict.get('item_embedding.weight', torch.empty(0)).shape
             
             if checkpoint_item_embedding_size != current_item_embedding_size:
-                logging.warning(f"Item embedding size mismatch:")
-                logging.warning(f"   Current model: {current_item_embedding_size}")
-                logging.warning(f"   Checkpoint: {checkpoint_item_embedding_size}")
-                logging.info("   Adjusting item embedding size...")
+                logging.warning(f"   - 物品嵌入层尺寸不匹配:")
+                logging.warning(f"     - 当前模型: {current_item_embedding_size}")
+                logging.warning(f"     - 检查点: {checkpoint_item_embedding_size}")
+                logging.info("   - 正在智能调整尺寸...")
                 
                 if len(checkpoint_item_embedding_size) > 0:
                     old_embedding = encoder_state_dict['item_embedding.weight']
@@ -368,25 +380,29 @@ def main():
                     min_items = min(old_embedding.shape[0], new_embedding.shape[0])
                     new_embedding[:min_items] = old_embedding[:min_items]
                     encoder_state_dict['item_embedding.weight'] = new_embedding
-                    logging.info(f"   ✅ Copied {min_items} item embeddings")
+                    logging.info(f"     - ✅ 已拷贝 {min_items} 个物品的嵌入。")
             
             missing_keys, unexpected_keys = model.encoder.load_state_dict(encoder_state_dict, strict=False)
             
             if missing_keys:
-                logging.warning(f"Missing keys: {missing_keys}")
+                logging.warning(f"   - 加载时发现缺失的键: {missing_keys}")
             if unexpected_keys:
-                logging.warning(f"Unexpected keys: {unexpected_keys}")
+                logging.warning(f"   - 加载时发现意外的键: {unexpected_keys}")
                 
-            logging.info("✅ Pre-trained HSTU encoder weights loaded successfully")
+            logging.info("✅ 预训练 HSTU 编码器权重加载成功。")
             
         except Exception as e:
-            logging.error(f"Could not load encoder weights: {e}")
-            logging.info("Training from scratch...")
+            logging.error(f"❌ 加载预训练编码器权重失败: {e}")
+            logging.info("   - 将从零开始训练...")
+    elif resumed_from_checkpoint:
+        logging.info("☑️ 已从检查点恢复，跳过加载独立的HSTU编码器权重。")
 
+    # 步骤 C: 冻结编码器（如果需要的话）
+    # 这个逻辑在所有权重加载操作之后执行，确保状态正确。
     if args.freeze_encoder:
         for param in model.encoder.parameters():
             param.requires_grad = False
-        logging.info("🔒 Encoder weights frozen.")
+        logging.info("🔒 编码器权重已冻结，在训练中不会更新。")
 
     # 8. 文本嵌入加载到模型
     model.decoder.load_text_embeddings(text_embedding_matrix.to(device))
@@ -502,37 +518,56 @@ def main():
         # 兼容旧版本PyTorch
         scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
     
-    # 9. 优化器和损失函数 (最终版差异化优化器)
+    # 9. 优化器和损失函数 (最终修复版：解决学习率冲突)
     logging.info("为模型不同部分设置差异化学习率...")
-    gate_params = [p for n, p in model.named_parameters() if 'gate_network' in n and p.requires_grad]
-    encoder_params = [p for n, p in model.encoder.named_parameters() if p.requires_grad]
     
-    embedding_params = []
-    if getattr(model.decoder, 'text_embedding', None) is not None and model.decoder.expert_config['content_expert'].get('trainable_embeddings', False):
-        embedding_params.extend(model.decoder.text_embedding.parameters())
-    if getattr(model.decoder, 'image_embedding', None) is not None and model.decoder.expert_config['image_expert'].get('trainable_embeddings', False):
-        embedding_params.extend(model.decoder.image_embedding.parameters())
+    # --- 权重绑定 (Tying Weights) ---
+    if model.decoder.final_projection is not None:
+        model.decoder.final_projection.weight = model.encoder.item_embedding.weight
         
-    main_param_ids = {id(p) for p_group in [gate_params, encoder_params, embedding_params] for p in p_group}
-    main_model_params = [p for p in model.parameters() if id(p) not in main_param_ids and p.requires_grad]
-
-    model.decoder.final_projection.weight = model.encoder.item_embedding.weight
+    # --- 参数分组 (Parameter Grouping) ---
+    # 为模型的不同部分创建独立的参数组，以便应用不同的学习率。
     
+    # 组1：门控网络参数
+    gate_params = [p for n, p in model.named_parameters() if 'gate_network' in n and p.requires_grad]
+    
+    # 组2：编码器中 *除了* item_embedding 之外的所有参数
+    # 这些参数是我们希望微调的，使用较低学习率。
+    encoder_other_params = [p for n, p in model.encoder.named_parameters() if 'item_embedding' not in n and p.requires_grad]
+    
+    # 组3：共享的 item_embedding 参数
+    # 因为它既是输入也是输出，需要一个更高的学习率来有效学习。
+    item_embedding_params = [p for n, p in model.encoder.named_parameters() if 'item_embedding' in n and p.requires_grad]
+    
+    # 组4：解码器主干参数
+    # 包含了除门控网络外的所有解码器层参数。
+    # 我们首先收集所有已分组参数的ID，以避免重复。
+    grouped_param_ids = {id(p) for p_group in [gate_params, encoder_other_params, item_embedding_params] for p in p_group}
+    decoder_main_params = [p for n, p in model.decoder.named_parameters() if id(p) not in grouped_param_ids and p.requires_grad]
+
+    # 从配置中获取学习率
+    decoder_lr = config['finetune']['learning_rate'].get('decoder_lr', 1e-4)
+    # 为共享嵌入层设置专属学习率，建议与解码器相同
+    embedding_lr = config['finetune']['learning_rate'].get('embedding_lr', decoder_lr) 
+    gate_lr = config['finetune']['learning_rate'].get('gate_lr', 1e-4)
+    encoder_lr = config['finetune']['learning_rate'].get('encoder_lr', 5e-6)
+
+    # 创建优化器实例
     optimizer = torch.optim.AdamW([
-        {'params': main_model_params, 'lr': config['finetune']['learning_rate']['decoder_lr']},
-        {'params': gate_params, 'lr': config['finetune']['learning_rate']['gate_lr']},
-        {'params': encoder_params, 'lr': config['finetune']['learning_rate']['encoder_lr']},
-        {'params': embedding_params, 'lr': config['finetune']['learning_rate'].get('embedding_lr', 1e-6)}
+        {'params': decoder_main_params, 'lr': decoder_lr},
+        {'params': item_embedding_params, 'lr': embedding_lr, 'weight_decay': 0}, # 嵌入层通常不使用或使用很小的权重衰减
+        {'params': gate_params, 'lr': gate_lr},
+        {'params': encoder_other_params, 'lr': encoder_lr},
     ], weight_decay=config['finetune']['weight_decay'])
 
-    logging.info(f"  - 主干网络学习率: {config['finetune']['learning_rate']['decoder_lr']}")
-    logging.info(f"  - 门控网络学习率: {config['finetune']['learning_rate']['gate_lr']}")
-    logging.info(f"  - 编码器学习率: {config['finetune']['learning_rate']['encoder_lr']}")
-    if embedding_params:
-        logging.info(f"  - 解冻的嵌入层学习率: {config['finetune']['learning_rate'].get('embedding_lr', 1e-6)}")
+    # 打印日志以确认设置
+    logging.info(f"  - 解码器主干学习率: {decoder_lr}")
+    logging.info(f"  - [关键] 共享嵌入层学习率: {embedding_lr}")
+    logging.info(f"  - 门控网络学习率: {gate_lr}")
+    logging.info(f"  - 编码器其他部分学习率: {encoder_lr}")
 
+    # 损失函数定义 (保持不变)
     criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id, label_smoothing=config['finetune'].get('label_smoothing', 0))
-
     # 10. 学习率调度器
     num_training_steps = len(train_loader) * config['finetune']['num_epochs']
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=config['finetune']['warmup_steps'], num_training_steps=num_training_steps)

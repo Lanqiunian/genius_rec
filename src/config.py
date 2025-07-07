@@ -31,6 +31,7 @@ def get_config():
         "sos_token_id": 1,
         "eos_token_id": 2,
         "mask_token_id": 3,
+        "num_special_tokens": 4,
         
         # =================================================================
         # 2. 模型超参数配置 (Model Hyperparameters)
@@ -74,12 +75,12 @@ def get_config():
         },
         
         # --- 阶段二: Encoder-Decoder 微调配置 ---
-  "finetune": {
+        "finetune": {
             "log_file": "finetune_genius_rec.log",
             "num_epochs": 50,
             "batch_size": 16,
             "learning_rate": {
-                "decoder_lr": 1e-3,  # 解码器学习率, 建议: 3e-4 或 1e-4
+                "decoder_lr": 1e-4,  # 解码器学习率, 建议: 3e-4 或 1e-4
                 "encoder_lr": 5e-6,  # 保持不变，用于精调
                 "gate_lr": 1e-4      # 门控网络学习率
             },

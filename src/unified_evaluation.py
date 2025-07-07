@@ -82,11 +82,14 @@ def evaluate_model_validation_with_ranking(model, val_loader, criterion, device,
     hr_total, ndcg_total, total_samples = 0.0, 0.0, 0
     total_gate_weights = None
     
+    num_special_tokens = config['num_special_tokens']
+
     with torch.no_grad():
         item_num = model.encoder.item_embedding.num_embeddings
         all_item_embeddings = None
         if num_candidates is None or num_candidates <= 0:
-            all_item_embeddings = model.encoder.item_embedding.weight[1:item_num]
+            # 修复：从num_special_tokens开始切片，确保只包含实际物品的嵌入
+            all_item_embeddings = model.encoder.item_embedding.weight[num_special_tokens:item_num]
 
         progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Validation]", leave=False)
 
@@ -173,14 +176,18 @@ def evaluate_model_validation_with_ranking(model, val_loader, criterion, device,
                 result[f'avg_{expert_name}_weight'] = avg_gate_weights[i].item()
     return result
 
-def evaluate_model_test(model, test_loader, device, item_num, top_k=10):
+def evaluate_model_test(model, test_loader, device, item_num, top_k=10, config=None):
     """
     【最终向量优化版】测试集评估，始终使用全量评估。
     """
     model.eval()
     hr_total, ndcg_total, total_samples = 0.0, 0.0, 0
+    
+    num_special_tokens = config['num_special_tokens'] if config else 4 # Default to 4 if config not provided
+
     with torch.no_grad():
-        all_item_embeddings = model.encoder.item_embedding.weight[1:item_num]
+        # 修复：从num_special_tokens开始切片，确保只包含实际物品的嵌入
+        all_item_embeddings = model.encoder.item_embedding.weight[num_special_tokens:item_num]
         progress_bar = tqdm(test_loader, desc="Test Set Evaluation")
         for batch in progress_bar:
             input_ids = batch['input_ids'].to(device)

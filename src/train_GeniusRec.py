@@ -328,22 +328,9 @@ def main():
             # 检查是否为迁移后的权重文件
             weights_path = Path(args.encoder_weights_path)
             
-            if "_migrated" in weights_path.stem:
-                logging.info(f"Loading migrated encoder weights from: {weights_path}")
-                load_path = weights_path
-            else:
-                # 检查是否存在迁移后的权重文件
-                migrated_weights_path = weights_path.parent / f"{weights_path.stem}_migrated.pth"
-                
-                if migrated_weights_path.exists():
-                    logging.info(f"Found migrated weights, loading from: {migrated_weights_path}")
-                    load_path = migrated_weights_path
-                else:
-                    logging.info(f"Loading original encoder weights from: {weights_path}")
-                    logging.warning("⚠️  使用原始权重可能导致维度不匹配，建议先运行权重迁移脚本")
-                    load_path = weights_path
+
             
-            checkpoint = torch.load(load_path, map_location=device, weights_only=False)
+            checkpoint = torch.load(weights_path , map_location=device, weights_only=False)
             
             # 处理不同的checkpoint格式
             if 'model_state_dict' in checkpoint:
@@ -615,7 +602,7 @@ def main():
         checkpoint = torch.load(best_model_path, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         
-        test_results = evaluate_model_test(model, test_loader, device, num_items, top_k=top_k)
+        test_results = evaluate_model_test(model, test_loader, device, num_items, top_k=top_k, config=config)
         
         logging.info(f"📈 Final Test Results:")
         logging.info(f"  🎯 Test HR@{top_k}: {test_results['test_hr']:.4f}")

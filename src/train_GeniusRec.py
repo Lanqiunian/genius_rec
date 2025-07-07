@@ -53,7 +53,7 @@ from src.decoder.decoder import GenerativeDecoder
 
 def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, epoch, num_epochs, pad_token_id, config, scaler=None):
     """
-    【最终版】训练一个epoch。
+    【最终重构版】训练一个epoch，完全适配全程Next-Token Prediction模式。
     """
     model.train()
     total_loss_value = 0.0
@@ -62,27 +62,38 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
     balancing_loss_alpha = config['finetune'].get('balancing_loss_alpha', 0.01)
 
     for batch_idx, batch in enumerate(progress_bar):
-        source_ids = batch['source_ids'].to(device)
-        decoder_input_ids = batch['decoder_input_ids'].to(device)
+        # --- 【核心修改 1/3】数据解包和掩码生成 ---
+        # 在新模式下，我们只需要统一的输入和对应的标签。
+        # 'source_ids' 和 'decoder_input_ids' 在新Dataset中是相同的，我们统一称为 input_ids。
+        input_ids = batch['source_ids'].to(device)
         labels = batch['labels'].to(device)
-        source_padding_mask = (source_ids == pad_token_id)
+        padding_mask = (input_ids == pad_token_id) # 掩码基于统一的输入生成
 
         optimizer.zero_grad()
 
         with torch.amp.autocast('cuda', enabled=(scaler is not None)):
+            # --- 【核心修改 2/3】调用模型的新接口 ---
+            # 不再区分source和decoder输入，直接传入统一的input_ids。
             logits, gate_weights, balancing_loss = model(
-                source_ids,
-                decoder_input_ids,
-                source_padding_mask,
+                input_ids=input_ids,
+                padding_mask=padding_mask,
                 return_weights=True,
-                
             )
             
+            # --- 【核心修改 3/3】损失计算 (逻辑不变，但上下文更清晰) ---
+            # 这里的逻辑完全无需改动，它已经完美适配Next-Token Prediction。
+            # 它会计算模型在序列每个位置的输出(logits)与真实下一个token(labels)之间的损失。
             task_loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
             
-            loss = task_loss + balancing_loss_alpha * balancing_loss
-            bal_loss_item = balancing_loss.item()
+            # 如果启用了平衡损失，则将其加入总损失
+            if balancing_loss is not None:
+                loss = task_loss + balancing_loss_alpha * balancing_loss
+                bal_loss_item = balancing_loss.item()
+            else:
+                loss = task_loss
+                bal_loss_item = 0.0
 
+        # --- 后续的优化器和梯度裁剪逻辑完全保持不变 ---
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -99,6 +110,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
         
         total_loss_value += loss.item()
         
+        # --- 日志记录部分保持不变 ---
         if gate_weights is not None:
             enabled_experts = [k for k, v in model.decoder.expert_config["experts"].items() if v]
             weights_postfix = {}

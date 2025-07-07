@@ -44,7 +44,6 @@ def get_config():
             "num_layers": 4,
             "num_heads": 4,
             "dropout": 0.1,
-            # item_num 和 pad_token_id 在训练脚本中动态传入
         },
 
         "decoder_model": {
@@ -53,8 +52,7 @@ def get_config():
             "num_layers": 4,
             "num_heads": 4,
             "ffn_hidden_dim": 64 * 4,    # 建议随 embedding_dim 调整, e.g., 128 * 4
-            "dropout_ratio": 0.3,        # 建议: 0.1 或 0.2
-             # num_items 在训练脚本中动态传入
+            "dropout_ratio": 0.2,        # 建议: 0.1 或 0.2
         },
 
         # =================================================================
@@ -67,7 +65,7 @@ def get_config():
             "num_epochs": 501,         
             "batch_size": 256,         
             "learning_rate": 1e-3,
-            "weight_decay": 0.3,
+            "weight_decay": 0.1,
             "early_stopping_patience": 20,
             "num_workers": 10,
             "num_neg_samples": 512, # 负采样数量
@@ -84,14 +82,16 @@ def get_config():
                 "encoder_lr": 5e-6,  # 保持不变，用于精调
                 "gate_lr": 1e-4      # 门控网络学习率
             },
-            "balancing_loss_alpha": 0.3, # 负载均衡损失的系数, 建议: 0.01 或 0.05
+            "balancing_loss_alpha": 0.1, # 负载均衡损失的系数, 建议: 0.01 或 0.05
             "label_smoothing": 0,
             "warmup_steps": 1000,
             "weight_decay": 0.01,    
             "early_stopping_patience": 4,
             "num_workers": 10,
-            # "warmup_epochs": 0,   
-            "split_ratio": 0.6,
+
+            "use_stochastic_length": False,
+            "stochastic_threshold": 20,
+            "stochastic_prob": 0.5,
               
         },
                 

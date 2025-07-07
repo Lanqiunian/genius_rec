@@ -72,9 +72,9 @@ class DecoderBlock(nn.Module):
 
 class GenerativeDecoder(nn.Module):
     """
-    【最终版】生成式解码器
-    - 增加了对 trainable_embeddings 的配置支持
-    - 实现了负载均衡损失以防止专家极化
+    【最终性能优化版】生成式解码器
+    - 采用“后期投影”MoE架构，极大提升训练速度。
+    - 专家在隐藏空间工作，只在最后进行一次到词汇表的投影。
     """
     def __init__(self, num_items: int, embedding_dim: int, num_layers: int, num_heads: int,
                  ffn_hidden_dim: int, max_seq_len: int, dropout_ratio: float = 0.1,
@@ -94,68 +94,37 @@ class GenerativeDecoder(nn.Module):
         self.expert_config = expert_config or {"experts": {}}
         self.enabled_experts = [k for k, v in self.expert_config["experts"].items() if v]
         num_experts = len(self.enabled_experts)
-        if num_experts == 0: raise ValueError("至少需要启用一个专家！")
-        print(f"🧠 启用的专家: {self.enabled_experts} (共{num_experts}个)")
-        
-        if self.expert_config["experts"].get("behavior_expert", False):
-            self.behavior_expert_fc = nn.Linear(embedding_dim, num_items)
+        if num_experts == 0: raise ValueError("At least one expert must be enabled!")
+        print(f"🧠 [Optimized] Enabled Experts: {self.enabled_experts} (Total: {num_experts})")
 
-        if self.expert_config["experts"].get("content_expert", False):
+        # Experts now output to embedding_dim
+        if "behavior_expert" in self.enabled_experts:
+            self.behavior_expert = nn.Linear(embedding_dim, embedding_dim)
+
+        if "content_expert" in self.enabled_experts:
             content_config = self.expert_config["content_expert"]
-            if content_config.get("trainable_embeddings", False):
-                print(" thawed Content Expert embeddings (trainable).")
-                self.text_embedding = nn.Embedding(num_items, content_config["text_embedding_dim"], padding_idx=pad_token_id)
-                self.text_embedding_matrix = None
-            else:
-                print("🧊 Frozen Content Expert embeddings (buffer).")
-                self.register_buffer('text_embedding_matrix', torch.zeros(1, 1))
-                self.text_embedding = None
-            if content_config.get("use_cross_attention", True):
-                self.content_expert_attention = nn.MultiheadAttention(embedding_dim, content_config["attention_heads"], dropout=dropout_ratio, batch_first=True)
-                self.content_attention_projection = nn.Linear(embedding_dim, content_config["text_embedding_dim"])
-            else:
-                self.content_expert_fc = nn.Linear(embedding_dim, content_config["text_embedding_dim"])
+            self.content_expert_attention = nn.MultiheadAttention(embedding_dim, content_config["attention_heads"], dropout=dropout_ratio, batch_first=True)
+            self.content_expert_projection = nn.Linear(embedding_dim, embedding_dim)
+            self.register_buffer('text_embedding_matrix', torch.zeros(1, 1))
 
-        if self.expert_config["experts"].get("image_expert", False):
+        if "image_expert" in self.enabled_experts:
             image_config = self.expert_config["image_expert"]
-            if image_config.get("trainable_embeddings", False):
-                print(" thawed Image Expert embeddings (trainable).")
-                self.image_embedding = nn.Embedding(num_items, image_config["image_embedding_dim"], padding_idx=pad_token_id)
-                self.image_embedding_matrix = None
-            else:
-                print("🧊 Frozen Image Expert embeddings (buffer).")
-                self.register_buffer('image_embedding_matrix', torch.zeros(1, 1))
-                self.image_embedding = None
-            if image_config.get("use_cross_attention", True):
-                self.image_expert_attention = nn.MultiheadAttention(embedding_dim, image_config["attention_heads"], dropout=dropout_ratio, batch_first=True)
-                self.image_attention_projection = nn.Linear(embedding_dim, image_config["image_embedding_dim"])
-            else:
-                self.image_expert_fc = nn.Linear(embedding_dim, image_config["image_embedding_dim"])
+            self.image_expert_attention = nn.MultiheadAttention(embedding_dim, image_config["attention_heads"], dropout=dropout_ratio, batch_first=True)
+            self.image_expert_projection = nn.Linear(embedding_dim, embedding_dim)
+            self.register_buffer('image_embedding_matrix', torch.zeros(1, 1))
 
-        gate_config = self.expert_config.get("gate_config", {})
-        gate_hidden_dim = gate_config.get("gate_hidden_dim", 64)
-        if gate_config.get("gate_type") == "mlp":
-            self.gate_network = nn.Sequential(nn.Linear(embedding_dim, gate_hidden_dim), nn.ReLU(), nn.Linear(gate_hidden_dim, num_experts))
-        else:
-            self.gate_network = nn.Linear(embedding_dim, num_experts)
+        self.gate_network = nn.Linear(embedding_dim, num_experts)
+        self.final_projection = nn.Linear(embedding_dim, num_items)
 
     def load_text_embeddings(self, embedding_matrix: torch.Tensor, verbose: bool = True):
-        if not self.expert_config["experts"].get("content_expert", False): return
-        if verbose: print("📄 正在加载预训练文本嵌入...")
-        if self.text_embedding is not None:
-            self.text_embedding.weight.data.copy_(embedding_matrix)
-        elif 'text_embedding_matrix' in self._buffers:
-            self.text_embedding_matrix = embedding_matrix.clone()
-        if verbose: print("✅ 文本嵌入加载成功")
+        if verbose: print("📄 Loading pre-trained text embeddings...")
+        self.text_embedding_matrix = embedding_matrix.clone()
+        if verbose: print("✅ Text embeddings loaded successfully.")
 
     def load_image_embeddings(self, embedding_matrix: torch.Tensor, verbose: bool = True):
-        if not self.expert_config["experts"].get("image_expert", False): return
-        if verbose: print("🖼️ 正在加载预训练图像嵌入...")
-        if self.image_embedding is not None:
-            self.image_embedding.weight.data.copy_(embedding_matrix)
-        elif 'image_embedding_matrix' in self._buffers:
-            self.image_embedding_matrix = embedding_matrix.clone()
-        if verbose: print("✅ 图像嵌入加载成功")
+        if verbose: print("🖼️ Loading pre-trained image embeddings...")
+        self.image_embedding_matrix = embedding_matrix.clone()
+        if verbose: print("✅ Image embeddings loaded successfully.")
 
     @staticmethod
     def _generate_square_subsequent_mask(sz: int):
@@ -163,8 +132,8 @@ class GenerativeDecoder(nn.Module):
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-    def forward(self, target_ids: torch.Tensor, encoder_output: torch.Tensor, memory_padding_mask: torch.Tensor,
-                return_weights: bool = False):
+    # --- 核心修复：确保`forward`方法签名正确 ---
+    def forward(self, target_ids: torch.Tensor, encoder_output: torch.Tensor, memory_padding_mask: torch.Tensor, return_weights: bool = False):
         
         batch_size, target_len = target_ids.size()
         positions = torch.arange(0, target_len, device=target_ids.device).unsqueeze(0)
@@ -177,65 +146,32 @@ class GenerativeDecoder(nn.Module):
         for layer in self.decoder_layers:
             hidden_state = layer(hidden_state, encoder_output, target_mask, memory_padding_mask)
 
-        # 1. 动态计算专家权重
-        gate_input = hidden_state
-        gate_logits = self.gate_network(gate_input.view(-1, self.embedding_dim))
-        gate_logits = gate_logits.view(batch_size, target_len, -1)
-        expert_weights = F.softmax(gate_logits, dim=-1) # Shape: [B, T, num_experts]
+        gate_logits = self.gate_network(hidden_state)
+        expert_weights = F.softmax(gate_logits, dim=-1).unsqueeze(-1)
 
-        # 2. 计算平衡损失 (balancing_loss)
         balancing_loss = torch.tensor(0.0, device=target_ids.device)
         if self.training:
-            # 使用更标准的 .mean(dim=(0, 1))
-            avg_probs_per_expert = expert_weights.mean(dim=(0, 1))
+            avg_probs_per_expert = expert_weights.squeeze(-1).mean(dim=(0, 1))
             balancing_loss = len(self.enabled_experts) * torch.sum(avg_probs_per_expert.pow(2))
 
-        # 3. 💡 **核心修正**: 初始化 final_logits 并使用新的 `expert_weights` 变量
-        final_logits = torch.zeros(batch_size, target_len, self.num_items, device=target_ids.device)
-        expert_idx = 0
+        cross_attention_context = None
+        if "content_expert" in self.enabled_experts or "image_expert" in self.enabled_experts:
+            cross_attention_context, _ = self.content_expert_attention(
+                query=hidden_state, key=encoder_output, value=encoder_output, key_padding_mask=memory_padding_mask
+            )
 
-        if self.expert_config["experts"].get("behavior_expert", False):
-            behavior_logits = self.behavior_expert_fc(hidden_state)
-            weight = expert_weights[:, :, expert_idx].unsqueeze(-1)
-            final_logits += weight * behavior_logits
-            expert_idx += 1
+        expert_outputs = []
+        if "behavior_expert" in self.enabled_experts:
+            expert_outputs.append(self.behavior_expert(hidden_state))
+        if "content_expert" in self.enabled_experts:
+            expert_outputs.append(self.content_expert_projection(cross_attention_context))
+        if "image_expert" in self.enabled_experts:
+            expert_outputs.append(self.image_expert_projection(cross_attention_context))
+        
+        stacked_expert_outputs = torch.stack(expert_outputs, dim=2)
+        final_hidden_state = (expert_weights * stacked_expert_outputs).sum(dim=2)
+        
+        final_logits = self.final_projection(final_hidden_state)
 
-        if self.expert_config["experts"].get("content_expert", False):
-            content_config = self.expert_config["content_expert"]
-            if content_config.get("use_cross_attention", True):
-                content_context_vector, _ = self.content_expert_attention(query=hidden_state, key=encoder_output, value=encoder_output, key_padding_mask=memory_padding_mask)
-                content_query = self.content_attention_projection(content_context_vector)
-            else:
-                content_query = self.content_expert_fc(hidden_state)
-            
-            text_weights_t = self.text_embedding.weight.t() if self.text_embedding is not None else self.text_embedding_matrix.t()
-            content_logits = torch.matmul(content_query, text_weights_t)
-            
-            # 直接使用 expert_weights
-            weight = expert_weights[:, :, expert_idx].unsqueeze(-1)
-            # 注意：这里的逻辑是 +=，因为 behavior 专家已经初始化了 final_logits
-            final_logits += weight * content_logits
-            expert_idx += 1
-
-        if self.expert_config["experts"].get("image_expert", False):
-            image_config = self.expert_config["image_expert"]
-            if image_config.get("use_cross_attention", True):
-                visual_context_vector, _ = self.image_expert_attention(query=hidden_state, key=encoder_output, value=encoder_output, key_padding_mask=memory_padding_mask)
-                visual_query = self.image_attention_projection(visual_context_vector)
-            else:
-                visual_query = self.image_expert_fc(hidden_state)
-            
-            image_weights_t = self.image_embedding.weight.t() if self.image_embedding is not None else self.image_embedding_matrix.t()
-            image_logits = torch.matmul(visual_query, image_weights_t)
-            
-            # 直接使用 expert_weights
-            weight = expert_weights[:, :, expert_idx].unsqueeze(-1)
-            final_logits += weight * image_logits
-            expert_idx += 1
-                
-        if expert_idx == 0: 
-            raise RuntimeError("至少需要启用一个专家！")
-
-        # 4. 💡 **返回正确的权重变量**
-        weights_to_return = expert_weights if return_weights else None
+        weights_to_return = expert_weights.squeeze(-1) if return_weights else None
         return final_logits, weights_to_return, balancing_loss

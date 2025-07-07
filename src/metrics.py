@@ -67,59 +67,61 @@ def get_metrics(batch_logits, batch_labels, k, pad_token_id=0):
 
 def compute_hr_ndcg_full(user_embeddings, all_item_embeddings, target_item_ids, k=10, special_token_offset=4):
     """
-    【向量优化版】全量评估：计算HR@K和NDCG@K（与HSTU和baseline完全一致的实现）
-    通过并行化操作一次性计算所有样本的排名，并保持与原版相同的平均逻辑。
+    【最终向量优化版】全量评估：一次性计算整个批次的HR@K和NDCG@K。
+    该版本通过矩阵运算完全消除了for循环，极大提升了在GPU上的评估效率。
 
     Args:
-        user_embeddings: 用户嵌入 [B, D]
-        all_item_embeddings: 所有物品的嵌入 [N, D] (N = num_items - offset)
-        target_item_ids: 目标物品ID [B]
-        k: 推荐列表长度
-        special_token_offset (int): ID到索引的偏移量。原代码为4。
+        user_embeddings (torch.Tensor): 用户嵌入 [B, D]。
+        all_item_embeddings (torch.Tensor): 所有物品的嵌入 [N, D]。
+        target_item_ids (torch.Tensor): 目标物品ID [B]。
+        k (int): 推荐列表长度。
+        special_token_offset (int): ID到物品嵌入矩阵索引的偏移量。
 
     Returns:
         tuple: (hr_float, ndcg_float)
     """
-    batch_size = user_embeddings.size(0)
-
     # 1. 筛选出有效的样本进行计算
-    valid_mask = (target_item_ids > 0)
+    valid_mask = (target_item_ids >= special_token_offset)
     if not valid_mask.any():
         return 0.0, 0.0
 
     active_user_embeddings = user_embeddings[valid_mask]
     active_target_ids = target_item_ids[valid_mask]
-    
+    num_valid_samples = active_user_embeddings.size(0)
+
     # 2. L2归一化
     active_user_embeddings = F.normalize(active_user_embeddings, p=2, dim=1)
     all_item_embeddings = F.normalize(all_item_embeddings, p=2, dim=1)
 
-    # 3. 计算用户与所有物品的相似度
-    # [num_valid, D] x [D, N] -> [num_valid, N]
+    # 3. 计算用户与所有物品的相似度分数
+    #    [num_valid, D] x [D, N] -> [num_valid, N]
     scores = torch.matmul(active_user_embeddings, all_item_embeddings.t())
 
     # 4. 【核心优化】向量化计算排名
     # 4.1. 获取每个有效目标物品的分数
+    #      将物品ID转换为在 all_item_embeddings 中的索引
     target_indices = active_target_ids - special_token_offset
     target_scores = scores.gather(1, target_indices.unsqueeze(1))
 
-    # 4.2. 计算排名：计算有多少物品的分数 >= 目标物品的分数
-    rank = (scores >= target_scores).sum(dim=1)
+    # 4.2. 并行计算排名：计算有多少物品的分数严格大于目标物品分数，再+1
+    rank = (scores > target_scores).sum(dim=1) + 1
 
-    # 5. 计算指标
+    # 5. 并行计算指标
     in_top_k = (rank <= k)
     
-    # 命中总数
-    hr_count = in_top_k.float().sum().item()
+    # HR 是命中样本数占有效样本总数的比例
+    hr = in_top_k.float().sum() / num_valid_samples
     
-    # NDCG总和
-    ndcg_sum = (1.0 / torch.log2(rank[in_top_k].float() + 1)).sum().item()
+    # 仅对命中的样本计算NDCG
+    # 创建一个全零的ndcg张量
+    ndcg_values = torch.zeros_like(rank, dtype=torch.float)
+    # 仅在命中(in_top_k)的位置，计算 1 / log2(rank + 1)
+    ndcg_values[in_top_k] = 1.0 / torch.log2(rank[in_top_k].float() + 1)
+    
+    # NDCG 是所有有效样本的ndcg值的平均
+    ndcg = ndcg_values.sum() / num_valid_samples
 
-    # 【保持一致】与原函数逻辑对齐，使用总批次大小作为分母
-    hr = hr_count / batch_size
-    ndcg = ndcg_sum / batch_size
-    
-    return hr, ndcg
+    return hr.item(), ndcg.item()
 
 
 def compute_hr_ndcg_batch(user_embeddings, all_item_embeddings, target_item_ids, k=10, special_token_offset=4):

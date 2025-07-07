@@ -73,108 +73,119 @@ def evaluate_model_validation(model, val_loader, criterion, device, pad_token_id
     
     return {'val_loss': avg_loss, 'val_ppl': perplexity}
 
-def evaluate_model_validation_with_ranking(model, val_loader, criterion, device, epoch, num_epochs, pad_token_id, config, num_candidates=None, top_k=10):
+def evaluate_model_validation_with_ranking(model, val_loader, criterion, device, epoch, num_epochs, pad_token_id, config, top_k=10, **kwargs):
     """
-    【最终版】验证集评估：计算loss、ppl和排序指标。
+    【最终优化版】验证集评估：同时计算loss, ppl, 和排序指标。
+    此版本完全向量化，通过并行矩阵运算来计算排序指标，以实现最高评估效率。
     """
     model.eval()
-    total_loss_tokens, total_tokens, total_valid_batches = 0.0, 0, 0
+    total_loss_tokens, total_tokens = 0.0, 0
     hr_total, ndcg_total, total_samples = 0.0, 0.0, 0
-    total_gate_weights = None
     
+    # --- For MoE expert weight analysis ---
+    total_gate_weights = None
+    total_valid_batches = 0
+    enabled_experts = [k for k, v in config['expert_system']['experts'].items() if v]
     num_special_tokens = config['num_special_tokens']
 
     with torch.no_grad():
+        # Pre-fetch all item embeddings for efficient similarity calculation
         item_num = model.encoder.item_embedding.num_embeddings
-        all_item_embeddings = None
-        if num_candidates is None or num_candidates <= 0:
-            # 修复：从num_special_tokens开始切片，确保只包含实际物品的嵌入
-            all_item_embeddings = model.encoder.item_embedding.weight[num_special_tokens:item_num]
+        all_item_embeddings = model.encoder.item_embedding.weight[num_special_tokens:item_num]
 
         progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Validation]", leave=False)
 
         for batch in progress_bar:
+            # --- Data Preparation ---
             source_ids = batch['source_ids'].to(device)
-            decoder_input_ids = batch['decoder_input_ids'].to(device)
             labels = batch['labels'].to(device)
-            source_padding_mask = (source_ids == pad_token_id)
+            padding_mask = (source_ids == pad_token_id)
             batch_size = source_ids.size(0)
 
-            logits, gate_weights, _ = model(
-                source_ids, decoder_input_ids, source_padding_mask,
+            # --- Model Forward Pass ---
+            logits, gate_weights, balancing_loss = model(
+                input_ids=source_ids,
+                padding_mask=padding_mask,
                 return_weights=True
             )
             
-            loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
+            # --- Loss and Perplexity Calculation ---
+            task_loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
             non_padding_mask = (labels != pad_token_id)
             num_tokens = non_padding_mask.sum().item()
+
             if num_tokens > 0:
-                total_loss_tokens += loss.item() * num_tokens
+                total_loss_tokens += task_loss.item() * num_tokens
                 total_tokens += num_tokens
             
+            # --- Expert Weight Aggregation (for analysis) ---
             if gate_weights is not None:
                 label_mask = non_padding_mask.float().unsqueeze(-1)
                 valid_gate_weights = gate_weights * label_mask
-                batch_sum = valid_gate_weights.sum(dim=1)
-                batch_count = label_mask.sum(dim=1)
-                batch_mean = batch_sum / (batch_count + 1e-8)
-                masked_gate_weights = batch_mean.mean(dim=0)
-                if total_gate_weights is None: total_gate_weights = masked_gate_weights
-                else: total_gate_weights += masked_gate_weights
-                total_valid_batches += 1
-            
+                batch_sum = valid_gate_weights.sum(dim=(0, 1))
+                batch_count = label_mask.sum()
+                if batch_count > 0:
+                    batch_mean = batch_sum / batch_count
+                    if total_gate_weights is None:
+                        total_gate_weights = batch_mean
+                    else:
+                        total_gate_weights += batch_mean
+                    total_valid_batches += 1
+
+            # --- Ranking Metrics Calculation (Fully Vectorized) ---
+            # 1. Get user embeddings from the last position of the encoder output
             encoder_outputs = model.encoder(source_ids)
             user_embeddings = encoder_outputs[:, -1, :]
-            
-            col_indices = torch.arange(labels.size(1), device=device)
-            masked_labels_indices = col_indices.expand_as(labels).masked_fill(~non_padding_mask, labels.size(1) + 1)
-            first_label_indices = torch.argmin(masked_labels_indices, dim=1)
-            target_item_ids = labels[torch.arange(batch_size), first_label_indices]
-            valid_samples_mask = (target_item_ids != pad_token_id)
-            
-            hr, ndcg = 0.0, 0.0
-            if valid_samples_mask.any():
-                if num_candidates is not None and num_candidates > 0:
-                    # (向量化的采样评估)
-                    active_user_embeddings = user_embeddings[valid_samples_mask]
-                    active_target_ids = target_item_ids[valid_samples_mask]
-                    num_valid_samples = active_user_embeddings.size(0)
-                    positive_ids = active_target_ids.unsqueeze(1)
-                    negative_ids = torch.randint(1, item_num, (num_valid_samples, num_candidates - 1), device=device)
-                    collisions = (negative_ids == positive_ids)
-                    while torch.any(collisions):
-                        negative_ids[collisions] = torch.randint(1, item_num, (collisions.sum().item(),), device=device)
-                        collisions = (negative_ids == positive_ids)
-                    all_candidate_ids = torch.cat([positive_ids, negative_ids], dim=1)
-                    candidate_embeddings = model.encoder.item_embedding(all_candidate_ids)
-                    scores = torch.bmm(active_user_embeddings.unsqueeze(1), candidate_embeddings.transpose(1, 2)).squeeze(1)
-                    rank = (scores[:, 1:] >= scores[:, 0].unsqueeze(1)).sum(dim=1) + 1
-                    in_top_k = (rank <= top_k)
-                    hr = in_top_k.float().mean().item()
-                    ndcg_values = 1.0 / torch.log2(rank[in_top_k].float() + 1.0)
-                    ndcg = ndcg_values.mean().item() if len(ndcg_values) > 0 else 0.0
-                else:
-                    # (全量评估)
-                    hr, ndcg = compute_hr_ndcg_full(user_embeddings, all_item_embeddings, target_item_ids, k=top_k)
 
-            hr_total += hr * batch_size
-            ndcg_total += ndcg * batch_size
-            total_samples += batch_size
-            progress_bar.set_postfix(loss=(loss.item() if num_tokens > 0 else 0.0), hr=hr, ndcg=ndcg)
-    
+            # 2. Extract the first valid label for each sequence in the batch as the ground truth
+            # This is a highly efficient way to replace a for-loop
+            first_label_indices = torch.argmax((labels != pad_token_id).int(), dim=1)
+            target_item_ids = labels.gather(1, first_label_indices.unsqueeze(1)).squeeze(1)
+
+            # 3. Call the fully vectorized metric computation function
+            hr, ndcg = compute_hr_ndcg_full(
+                user_embeddings, 
+                all_item_embeddings, 
+                target_item_ids, 
+                k=top_k, 
+                special_token_offset=num_special_tokens
+            )
+
+            # Aggregate results, using the actual batch size for averaging
+            if hr is not None and ndcg is not None:
+                 hr_total += hr * batch_size
+                 ndcg_total += ndcg * batch_size
+                 total_samples += batch_size
+
+            progress_bar.set_postfix(
+                loss=(task_loss.item() if num_tokens > 0 else 0.0), 
+                hr=f"{hr:.4f}", 
+                ndcg=f"{ndcg:.4f}"
+            )
+
+    # --- Final Metrics Calculation ---
     avg_loss = total_loss_tokens / total_tokens if total_tokens > 0 else 0
     perplexity = math.exp(avg_loss) if avg_loss > 0 and avg_loss < 20 else float('inf')
-    avg_gate_weights = total_gate_weights / total_valid_batches if total_valid_batches > 0 else None
     avg_hr = hr_total / total_samples if total_samples > 0 else 0.0
     avg_ndcg = ndcg_total / total_samples if total_samples > 0 else 0.0
     
-    result = {'val_loss': avg_loss, 'val_ppl': perplexity, 'val_hr': avg_hr, 'val_ndcg': avg_ndcg, 'avg_gate_weights': avg_gate_weights, 'evaluated_samples': total_samples}
-    if avg_gate_weights is not None:
-        enabled_experts = [k for k, v in model.decoder.expert_config["experts"].items() if v]
+    # --- Prepare result dictionary ---
+    result = {
+        'val_loss': avg_loss, 
+        'val_ppl': perplexity, 
+        'val_hr': avg_hr, 
+        'val_ndcg': avg_ndcg,
+        'evaluated_samples': total_samples
+    }
+    
+    if total_gate_weights is not None and total_valid_batches > 0:
+        avg_gate_weights = total_gate_weights / total_valid_batches
         for i, expert_name in enumerate(enabled_experts):
             if i < len(avg_gate_weights):
                 result[f'avg_{expert_name}_weight'] = avg_gate_weights[i].item()
+
     return result
+
 
 def evaluate_model_test(model, test_loader, device, item_num, top_k=10, config=None):
     """

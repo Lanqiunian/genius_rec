@@ -15,8 +15,7 @@ GENIUS-Rec是一个基于Transformer架构的生成式序列推荐系统，结�
   - 行为专家：基于用户历史行为模式
   - 内容专家：基于物品文本语义信息
   - 图像专家：基于物品视觉特征
-- **📝 多模态嵌入**: 支持Google Gemini文本嵌入和CLIP图像嵌入
-- **⚡ 高效训练**: 支持GPU加速，内存优化，批处理等推荐系统
+- **📝 多模态嵌入**: 引入预训练大模型（目前用的Gemini和Clip）
 
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
@@ -34,7 +33,7 @@ GENIUS-Rec是一个基于Transformer架构的生成式序列推荐系统，结�
 
 为实现此目标，GENIUS-Rec采用了一个标准的Encoder-Decoder（编码器-解码器）架构：
 
-* **编码器 (Encoder)**: 为了追求极致的序列理解能力，完整复现并预训练了Meta AI提出的SOTA模型 **HSTU (Hierarchical Sequential Transduction Unit)**，使其能深度编码用户的行为历史。
+* **编码器 (Encoder)**: 为了追求极致的序列理解能力，复现并预训练了Meta AI提出的SOTA模型 **HSTU (Hierarchical Sequential Transduction Unit)**，使其能深度编码用户的行为历史。
 * **解码器 (Decoder)**: 在编码器提供的用户理解之上，构建了一个标准的**生成式Transformer解码器**,融入MoE，负责自回归地生成推荐序列。
 
 ## 项目进展与核心成果
@@ -61,6 +60,7 @@ GENIUS-Rec是一个基于Transformer架构的生成式序列推荐系统，结�
 
     
 ## 快速开始 (Quick Start)
+### 嵌入库得单独准备，太大了暂时不放在仓库里。
 
 ### 1. 环境搭建
 

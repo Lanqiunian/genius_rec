@@ -72,107 +72,102 @@ class DecoderBlock(nn.Module):
 
 class GenerativeDecoder(nn.Module):
     """
-    【最终修复与优化版】生成式解码器
-    - 修正了交叉注意力的共享逻辑，确保所有专家正确参与训练。
-    - 保留了“后期投影”MoE架构以保证训练速度。
-    - 增加了门控噪声选项，以解决专家极化问题。
+    【最终修复版】生成式解码器
+    - 修复了多模态嵌入矩阵在forward中从未被使用的根本性Bug。
+    - 确保内容/图像专家通过交叉注意力，正确地“读取”对应的嵌入信息。
     """
     def __init__(self, num_items: int, embedding_dim: int, num_layers: int, num_heads: int,
-                    ffn_hidden_dim: int, max_seq_len: int, dropout_ratio: float = 0.1,
-                    pad_token_id: int = 0, text_embedding_dim: int = 768,
-                    expert_config: dict = None, **kwargs):
-            super(GenerativeDecoder, self).__init__()
+                 ffn_hidden_dim: int, max_seq_len: int, dropout_ratio: float = 0.1,
+                 pad_token_id: int = 0, text_embedding_dim: int = 768,
+                 expert_config: dict = None, **kwargs):
+        super(GenerativeDecoder, self).__init__()
 
-            self.item_embedding = nn.Embedding(num_items, embedding_dim, padding_idx=pad_token_id)
-            self.pos_embedding = nn.Embedding(max_seq_len, embedding_dim)
-            self.decoder_layers = nn.ModuleList(
-                [DecoderBlock(embedding_dim, num_heads, ffn_hidden_dim, dropout_ratio) for _ in range(num_layers)]
+        self.item_embedding = nn.Embedding(num_items, embedding_dim, padding_idx=pad_token_id)
+        self.pos_embedding = nn.Embedding(max_seq_len, embedding_dim)
+        self.decoder_layers = nn.ModuleList(
+            [DecoderBlock(embedding_dim, num_heads, ffn_hidden_dim, dropout_ratio) for _ in range(num_layers)]
+        )
+        self.dropout = nn.Dropout(dropout_ratio)
+        self.embedding_dim = embedding_dim
+        self.num_items = num_items
+        
+        self.expert_config = expert_config or {"experts": {}}
+        self.enabled_experts = [k for k, v in self.expert_config["experts"].items() if v]
+        num_experts = len(self.enabled_experts)
+        if num_experts == 0: raise ValueError("At least one expert must be enabled!")
+        print(f"🧠 [Final Corrected Version] Enabled Experts: {self.enabled_experts}")
+
+        # --- 行为专家 ---
+        if "behavior_expert" in self.enabled_experts:
+            self.behavior_expert_projection = nn.Linear(embedding_dim, embedding_dim)
+
+        # --- 内容专家 ---
+        if "content_expert" in self.enabled_experts:
+            content_config = self.expert_config["content_expert"]
+            text_dim = content_config["text_embedding_dim"]
+            # 【核心修复】新增一个投影层，用于将高维文本嵌入投影到模型维度
+            self.text_embedding_projection = nn.Linear(text_dim, embedding_dim)
+            self.content_attention = nn.MultiheadAttention(embedding_dim, content_config["attention_heads"], dropout=dropout_ratio, batch_first=True)
+            self.content_expert_projection = nn.Sequential(
+                nn.Linear(embedding_dim, embedding_dim * 2), # 放大
+                nn.ReLU(),
+                nn.Dropout(dropout_ratio),
+                nn.Linear(embedding_dim * 2, embedding_dim) # 缩小回
             )
-            self.dropout = nn.Dropout(dropout_ratio)
-            self.embedding_dim = embedding_dim
-            self.num_items = num_items
-            
-            self.expert_config = expert_config or {"experts": {}}
-            self.enabled_experts = [k for k, v in self.expert_config["experts"].items() if v]
-            num_experts = len(self.enabled_experts)
-            if num_experts == 0: raise ValueError("At least one expert must be enabled!")
-            print(f"🧠 [Final Version] Enabled Experts: {self.enabled_experts} (Total: {num_experts})")
+            self.register_buffer('text_embedding_matrix', torch.zeros(1, 1))
 
-            # --- 【核心修改】创建一个辅助函数来动态构建投影层 ---
-            def create_projection_layer(expert_name, config):
-                projection_type = config.get(f"{expert_name}_projection_type", "simple")
-                if projection_type == "mlp":
-                    print(f"  - {expert_name.replace('_', ' ').title()} Projection: MLP (with Dropout)")
-                    return nn.Sequential(
-                        nn.Linear(embedding_dim, embedding_dim * 2),
-                        nn.ReLU(),
-                        nn.Dropout(dropout_ratio),
-                        nn.Linear(embedding_dim * 2, embedding_dim)
-                    )
-                else:
-                    print(f"  - {expert_name.replace('_', ' ').title()} Projection: Simple (Linear Layer)")
-                    return nn.Linear(embedding_dim, embedding_dim)
-            
-            # --- 共享交叉注意力模块 (逻辑不变) ---
-            self.shared_cross_attention = None
-            if "content_expert" in self.enabled_experts or "image_expert" in self.enabled_experts:
-                attention_heads = self.expert_config.get("content_expert", {}).get("attention_heads", num_heads)
-                self.shared_cross_attention = nn.MultiheadAttention(embedding_dim, attention_heads, dropout=dropout_ratio, batch_first=True)
-                print(f"✅ Shared Cross-Attention module created for multimodal experts.")
+        # --- 图像专家 ---
+        if "image_expert" in self.enabled_experts:
+            image_config = self.expert_config["image_expert"]
+            image_dim = image_config["image_embedding_dim"]
+            # 【核心修复】新增一个投影层，用于将高维图像嵌入投影到模型维度
+            self.image_embedding_projection = nn.Linear(image_dim, embedding_dim)
+            self.image_attention = nn.MultiheadAttention(embedding_dim, image_config["attention_heads"], dropout=dropout_ratio, batch_first=True)
+            self.image_expert_projection = nn.Sequential(
+                nn.Linear(embedding_dim, embedding_dim * 2),
+                nn.ReLU(),
+                nn.Dropout(dropout_ratio),
+                nn.Linear(embedding_dim * 2, embedding_dim)
+            )
+            self.register_buffer('image_embedding_matrix', torch.zeros(1, 1))
 
-            # --- 专家网络定义 (使用新的辅助函数) ---
-            if "behavior_expert" in self.enabled_experts:
-                self.behavior_expert = nn.Linear(embedding_dim, embedding_dim)
-
-            if "content_expert" in self.enabled_experts:
-                content_config = self.expert_config["content_expert"]
-                self.content_expert_projection = create_projection_layer("text", content_config)
-                self.register_buffer('text_embedding_matrix', torch.zeros(1, 1))
-
-            if "image_expert" in self.enabled_experts:
-                image_config = self.expert_config["image_expert"]
-                self.image_expert_projection = create_projection_layer("image", image_config)
-                self.register_buffer('image_embedding_matrix', torch.zeros(1, 1))
-
-            # --- 门控网络和最终输出层 (逻辑不变) ---
-            gate_config = self.expert_config.get("gate_config", {})
-            gate_type = gate_config.get("gate_type", "simple")
-            self.gate_noise_epsilon = gate_config.get("noise_epsilon", 0.1)
-
-            if gate_type == "mlp":
-                gate_hidden_dim = gate_config.get("gate_hidden_dim", 64)
-                self.gate_network = nn.Sequential(
-                    nn.Linear(embedding_dim, gate_hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(dropout_ratio),
-                    nn.Linear(gate_hidden_dim, num_experts)
-                )
-                print("🚪 Gating Network Type: MLP (with Dropout for regularization)")
-            else:
-                self.gate_network = nn.Linear(embedding_dim, num_experts)
-                print("🚪 Gating Network Type: Simple (Single Linear Layer)")
-            
-            self.final_projection = nn.Linear(embedding_dim, num_items)
+        # --- 门控网络和最终输出层 (逻辑不变) ---
+        gate_config = self.expert_config.get("gate_config", {})
+        gate_type = gate_config.get("gate_type", "mlp")
+        self.gate_noise_epsilon = gate_config.get("noise_epsilon", 0.1)
+        if gate_type == "mlp":
+            gate_hidden_dim = gate_config.get("gate_hidden_dim", 64)
+            self.gate_network = nn.Sequential(
+                nn.Linear(embedding_dim, gate_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout_ratio),
+                nn.Linear(gate_hidden_dim, num_experts)
+            )
+            print("🚪 Gating Network Type: MLP (with Dropout)")
+        else:
+            self.gate_network = nn.Linear(embedding_dim, num_experts)
+            print("🚪 Gating Network Type: Simple")
+        
+        self.final_projection = nn.Linear(embedding_dim, num_items)
 
     def load_text_embeddings(self, embedding_matrix: torch.Tensor, verbose: bool = True):
-        if verbose: print("📄 Loading pre-trained text embeddings...")
+        
         self.text_embedding_matrix = embedding_matrix.clone()
-        if verbose: print("✅ Text embeddings loaded successfully.")
 
     def load_image_embeddings(self, embedding_matrix: torch.Tensor, verbose: bool = True):
-        if verbose: print("🖼️ Loading pre-trained image embeddings...")
+        
         self.image_embedding_matrix = embedding_matrix.clone()
-        if verbose: print("✅ Image embeddings loaded successfully.")
 
     @staticmethod
     def _generate_square_subsequent_mask(sz: int):
+        
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-    # --- 核心修复：确保`forward`方法签名正确 ---
-    def forward(self, target_ids: torch.Tensor, encoder_output: torch.Tensor, memory_padding_mask: torch.Tensor, return_weights: bool = False):
+    def forward(self, target_ids: torch.Tensor, encoder_output: torch.Tensor, memory_padding_mask: torch.Tensor, return_weights: bool = False, **kwargs):
         
+        # --- 输入处理和主解码流程 (不变) ---
         batch_size, target_len = target_ids.size()
         positions = torch.arange(0, target_len, device=target_ids.device).unsqueeze(0)
         target_emb = self.item_embedding(target_ids) * math.sqrt(self.embedding_dim)
@@ -184,41 +179,46 @@ class GenerativeDecoder(nn.Module):
         for layer in self.decoder_layers:
             hidden_state = layer(hidden_state, encoder_output, target_mask, memory_padding_mask)
 
-        # 1. 门控网络计算
+        # --- 门控网络和平衡损失 (不变) ---
         gate_logits = self.gate_network(hidden_state)
-        # --- 【核心修复 3/3】仅在训练时加入门控噪声，对抗专家极化 ---
         if self.training and self.gate_noise_epsilon > 0:
             noise = torch.randn_like(gate_logits) * self.gate_noise_epsilon
             gate_logits += noise
         expert_weights = F.softmax(gate_logits, dim=-1).unsqueeze(-1)
-
-        # 2. 平衡损失计算
+        
         balancing_loss = torch.tensor(0.0, device=target_ids.device)
         if self.training:
             avg_probs_per_expert = expert_weights.squeeze(-1).mean(dim=(0, 1))
             balancing_loss = len(self.enabled_experts) * torch.sum(avg_probs_per_expert.pow(2))
 
-        # 3. 共享的交叉注意力计算
-        cross_attention_context = None
-        if self.shared_cross_attention is not None:
-            cross_attention_context, _ = self.shared_cross_attention(
-                query=hidden_state, key=encoder_output, value=encoder_output, key_padding_mask=memory_padding_mask
-            )
-
-        # 4. 在隐藏空间中计算专家输出
+        # --- 【最终核心修复】计算专家输出 ---
         expert_outputs = []
         if "behavior_expert" in self.enabled_experts:
-            expert_outputs.append(self.behavior_expert(hidden_state))
-        if "content_expert" in self.enabled_experts and cross_attention_context is not None:
-            expert_outputs.append(self.content_expert_projection(cross_attention_context))
-        if "image_expert" in self.enabled_experts and cross_attention_context is not None:
-            expert_outputs.append(self.image_expert_projection(cross_attention_context))
+            expert_outputs.append(self.behavior_expert_projection(hidden_state))
+
+        if "content_expert" in self.enabled_experts:
+            # 1. 从知识库中，为当前序列的物品ID查找对应的文本嵌入
+            text_history_emb = F.embedding(target_ids, self.text_embedding_matrix)
+            # 2. 将高维文本嵌入投影到模型维度
+            projected_text_history_emb = self.text_embedding_projection(text_history_emb)
+            # 3. 内容专家进行交叉注意力，Query是当前状态，Key/Value是文本历史
+            content_context, _ = self.content_attention(
+                query=hidden_state, key=projected_text_history_emb, value=projected_text_history_emb
+            )
+            expert_outputs.append(self.content_expert_projection(content_context))
+
+        if "image_expert" in self.enabled_experts:
+            # 图像专家同理
+            image_history_emb = F.embedding(target_ids, self.image_embedding_matrix)
+            projected_image_history_emb = self.image_embedding_projection(image_history_emb)
+            image_context, _ = self.image_attention(
+                query=hidden_state, key=projected_image_history_emb, value=projected_image_history_emb
+            )
+            expert_outputs.append(self.image_expert_projection(image_context))
         
-        # 5. 加权融合
+        # --- 融合与最终投影 (不变) ---
         stacked_expert_outputs = torch.stack(expert_outputs, dim=2)
         final_hidden_state = (expert_weights * stacked_expert_outputs).sum(dim=2)
-        
-        # 6. 最终投影
         final_logits = self.final_projection(final_hidden_state)
 
         weights_to_return = expert_weights.squeeze(-1) if return_weights else None

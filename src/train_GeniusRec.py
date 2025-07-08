@@ -518,52 +518,61 @@ def main():
         # 兼容旧版本PyTorch
         scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
     
-    # 9. 优化器和损失函数 (最终修复版：解决学习率冲突)
+# 9. 优化器和损失函数 (最终版：包含独立的专家投影层学习率)
+    # =================================================================
     logging.info("为模型不同部分设置差异化学习率...")
     
     # --- 权重绑定 (Tying Weights) ---
     if model.decoder.final_projection is not None:
         model.decoder.final_projection.weight = model.encoder.item_embedding.weight
-        
+        logging.info("✅ [核心优化] 已成功绑定解码器输出层与编码器输入嵌入层的权重。")
+
     # --- 参数分组 (Parameter Grouping) ---
-    # 为模型的不同部分创建独立的参数组，以便应用不同的学习率。
     
     # 组1：门控网络参数
     gate_params = [p for n, p in model.named_parameters() if 'gate_network' in n and p.requires_grad]
     
-    # 组2：编码器中 *除了* item_embedding 之外的所有参数
-    # 这些参数是我们希望微调的，使用较低学习率。
+    # 【新增】组2：专家投影层参数 (我们希望它们快速学习)
+    expert_projection_params = [
+        p for n, p in model.named_parameters() 
+        if ('content_expert_projection' in n or 'image_expert_projection' in n) and p.requires_grad
+    ]
+    
+    # 组3：编码器中 *除了* item_embedding 之外的所有参数 (微调)
     encoder_other_params = [p for n, p in model.encoder.named_parameters() if 'item_embedding' not in n and p.requires_grad]
     
-    # 组3：共享的 item_embedding 参数
-    # 因为它既是输入也是输出，需要一个更高的学习率来有效学习。
+    # 组4：共享的 item_embedding 参数 (需要较高学习率)
     item_embedding_params = [p for n, p in model.encoder.named_parameters() if 'item_embedding' in n and p.requires_grad]
     
-    # 组4：解码器主干参数
-    # 包含了除门控网络外的所有解码器层参数。
-    # 我们首先收集所有已分组参数的ID，以避免重复。
-    grouped_param_ids = {id(p) for p_group in [gate_params, encoder_other_params, item_embedding_params] for p in p_group}
-    decoder_main_params = [p for n, p in model.decoder.named_parameters() if id(p) not in grouped_param_ids and p.requires_grad]
+    # 组5：解码器主干参数 (其他所有参数)
+    grouped_param_ids = {
+        id(p) for p_group in [gate_params, expert_projection_params, encoder_other_params, item_embedding_params] 
+        for p in p_group
+    }
+    decoder_main_params = [p for n, p in model.named_parameters() if id(p) not in grouped_param_ids and p.requires_grad]
 
     # 从配置中获取学习率
     decoder_lr = config['finetune']['learning_rate'].get('decoder_lr', 1e-4)
-    # 为共享嵌入层设置专属学习率，建议与解码器相同
     embedding_lr = config['finetune']['learning_rate'].get('embedding_lr', decoder_lr) 
     gate_lr = config['finetune']['learning_rate'].get('gate_lr', 1e-4)
     encoder_lr = config['finetune']['learning_rate'].get('encoder_lr', 5e-6)
+    # 【新增】为专家投影层设置一个更高的学习率
+    expert_projection_lr = config['finetune']['learning_rate'].get('expert_projection_lr', 5e-4) 
 
-    # 创建优化器实例
+    # 创建最终版的优化器实例
     optimizer = torch.optim.AdamW([
         {'params': decoder_main_params, 'lr': decoder_lr},
-        {'params': item_embedding_params, 'lr': embedding_lr, 'weight_decay': 0}, # 嵌入层通常不使用或使用很小的权重衰减
+        {'params': item_embedding_params, 'lr': embedding_lr, 'weight_decay': 0},
         {'params': gate_params, 'lr': gate_lr},
         {'params': encoder_other_params, 'lr': encoder_lr},
+        {'params': expert_projection_params, 'lr': expert_projection_lr} # 👈 新增参数组
     ], weight_decay=config['finetune']['weight_decay'])
 
     # 打印日志以确认设置
     logging.info(f"  - 解码器主干学习率: {decoder_lr}")
-    logging.info(f"  - [关键] 共享嵌入层学习率: {embedding_lr}")
+    logging.info(f"  - 共享嵌入层学习率: {embedding_lr}")
     logging.info(f"  - 门控网络学习率: {gate_lr}")
+    logging.info(f"  - 专家投影层学习率: {expert_projection_lr}")
     logging.info(f"  - 编码器其他部分学习率: {encoder_lr}")
 
     # 损失函数定义 (保持不变)

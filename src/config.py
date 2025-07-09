@@ -76,7 +76,7 @@ def get_config():
         "finetune": {
             "log_file": "finetune_genius_rec.log",
             "num_epochs": 50,
-            "batch_size": 16,
+            "batch_size": 4,
             "learning_rate": {
                 "decoder_lr": 1e-4,  # 解码器学习率, 建议: 3e-4 或 1e-4
                 "encoder_lr": 5e-6,  # 保持不变，用于精调
@@ -94,6 +94,11 @@ def get_config():
             "use_stochastic_length": False,
             "stochastic_threshold": 20,
             "stochastic_prob": 0.5,
+
+            # 加入sampledsoftmax loss相关参数
+            "use_sampled_softmax": True,  # 开关
+            "num_neg_samples": 512,       # 负采样数量
+            "temperature": 0.05        # 温度参数
               
         },
                 

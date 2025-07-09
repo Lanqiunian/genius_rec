@@ -53,38 +53,66 @@ from src.decoder.decoder import GenerativeDecoder
 
 def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, epoch, num_epochs, pad_token_id, config, scaler=None):
     """
-    【最终修复版】训练一个epoch。
-    - 适配“随机分割的前缀预测后缀”数据模式，彻底杜绝数据泄露。
+    【Sampled Softmax 最终修改版】训练一个epoch。
+    - 适配“随机分割的前缀预测后缀”数据模式。
+    - 动态处理Sampled Softmax和全量词汇表两种训练模式。
     """
     model.train()
     total_loss_value = 0.0
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Training]", leave=True)
 
+    # --- ↓↓↓ 新增/修改的代码 ↓↓↓ ---
+    # 从配置中获取训练参数
     balancing_loss_alpha = config['finetune'].get('balancing_loss_alpha', 0.01)
+    use_sampled_softmax = config['finetune'].get('use_sampled_softmax', False)
+    # --- ↑↑↑ 新增/修改的代码 ↑↑↑ ---
 
     for batch_idx, batch in enumerate(progress_bar):
-        # --- 【核心修复】解包分离的 source 和 target ---
+        # --- 数据准备 ---
         source_ids = batch['source_ids'].to(device)
         decoder_input_ids = batch['decoder_input_ids'].to(device)
         labels = batch['labels'].to(device)
-        
-        # 掩码现在基于source_ids生成，用于编码器的交叉注意力
         source_padding_mask = (source_ids == pad_token_id)
+        
+        # --- ↓↓↓ 新增/修改的代码: 获取负样本 ↓↓↓ ---
+        negative_samples = batch.get('negative_samples')
+        if use_sampled_softmax and negative_samples is not None:
+            negative_samples = negative_samples.to(device)
+        # --- ↑↑↑ 新增/修改的代码: 获取负样本 ↑↑↑ ---
 
         optimizer.zero_grad()
 
         with torch.amp.autocast('cuda', enabled=(scaler is not None)):
-            # --- 【核心修复】调用严格分离source和target的模型接口 ---
+            # --- ↓↓↓ 新增/修改的代码: 调用新的模型接口 ↓↓↓ ---
+            # 传递所有需要的参数，让模型内部处理
             logits, gate_weights, balancing_loss, _ = model(
                 source_ids=source_ids,
                 decoder_input_ids=decoder_input_ids,
                 source_padding_mask=source_padding_mask,
+                # **kwargs 将包含以下内容
+                labels=labels,                     # 用于模型内部查找正样本嵌入
+                negative_samples=negative_samples, # 传递负样本
+                item_embedding_layer=model.encoder.item_embedding, # 传递共享的嵌入层
                 return_weights=True,
             )
             
-            # --- 损失计算 (逻辑不变) ---
-            task_loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
-            
+            # --- ↓↓↓ 新增/修改的代码: 动态计算损失 ↓↓↓ ---
+            if use_sampled_softmax:
+                # 在Sampled Softmax模式下，正样本总是在第0位，所以目标是全0张量。
+                # logits 形状: [B, T, 1 + num_neg]
+                target_for_loss = torch.zeros_like(labels)
+                
+                # 关键：只对非padding的位置计算损失
+                non_padding_mask = (labels.view(-1) != pad_token_id)
+                active_logits = logits.view(-1, logits.size(-1))[non_padding_mask]
+                active_target_for_loss = target_for_loss.view(-1)[non_padding_mask]
+
+                task_loss = criterion(active_logits, active_target_for_loss)
+            else:
+                # 保持原有的全量词汇表损失计算
+                task_loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
+            # --- ↑↑↑ 新增/修改的代码: 动态计算损失 ↑↑↑ ---
+
             if balancing_loss is not None:
                 loss = task_loss + balancing_loss_alpha * balancing_loss
                 bal_loss_item = balancing_loss.item()
@@ -126,7 +154,6 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
     avg_loss = total_loss_value / len(dataloader)
     logging.info(f"Epoch {epoch+1} training finished. Average Loss: {avg_loss:.4f}")
     return avg_loss
-
 
 def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device):
     """
@@ -262,7 +289,7 @@ def main():
     logging.info(f"Device: {device}")
     logging.info(f"Arguments: {args}")
 
-    # 4. 数据加载和ID映射处理
+     # 4. 数据加载和ID映射处理
     logging.info("Loading data from processed directory...")
     with open(config['data']['id_maps_file'], 'rb') as f:
         id_maps = pickle.load(f)
@@ -276,9 +303,11 @@ def main():
     if not enabled_experts: raise ValueError("❌ 至少需要启用一个专家！")
     logging.info(f"🧠 已启用专家: {enabled_experts}")
 
-    train_dataset = Seq2SeqRecDataset(config, config['data']['train_file'])
-    val_dataset = Seq2SeqRecDataset(config, config['data']['validation_file'])
+    # 【核心修改】创建Dataset时传入id_maps
+    train_dataset = Seq2SeqRecDataset(config, config['data']['train_file'], is_validation=False, item_maps=id_maps)
+    val_dataset = Seq2SeqRecDataset(config, config['data']['validation_file'], is_validation=True, item_maps=id_maps)
     test_dataset = ValidationDataset(config['data']['test_file'], config['encoder_model']['max_len'], config['pad_token_id'])
+    
     train_loader = DataLoader(train_dataset, batch_size=config['finetune']['batch_size'], shuffle=True, num_workers=config['finetune']['num_workers'])
     val_loader = DataLoader(val_dataset, batch_size=config['finetune']['batch_size'], shuffle=False, num_workers=config['finetune']['num_workers'])
     test_loader = DataLoader(test_dataset, batch_size=config['finetune']['batch_size'], shuffle=False, num_workers=config['finetune']['num_workers'])
@@ -315,7 +344,7 @@ def main():
     config['decoder_model']['text_embedding_dim'] = text_embedding_dim
     
     # 【新增】传递专家配置到模型
-    model = GENIUSRecModel(config['encoder_model'], config['decoder_model'], config['expert_system']).to(device)
+    model = GENIUSRecModel(config).to(device)
     logging.info("GENIUS-Rec model created with expert configuration.")
     
     # 打印启用的专家信息

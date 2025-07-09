@@ -1,18 +1,18 @@
-# src/GeniusRec.py (最终修复版)
+# src/GeniusRec.py (修改版)
 
 import torch
 import torch.nn as nn
 from src.encoder.encoder import Hstu
-from src.decoder.decoder import GenerativeDecoder
+from src.decoder.decoder_sampled_softmax import GenerativeDecoder # 假设新的解码器在此文件
 
 class GENIUSRecModel(nn.Module):
-    def __init__(self, encoder_config, decoder_config, expert_config=None):
+    def __init__(self, config): # 简化构造函数，直接传入总配置
         super().__init__()
-        self.encoder = Hstu(**encoder_config)
-        decoder_config_with_expert = decoder_config.copy()
-        if expert_config:
-            decoder_config_with_expert['expert_config'] = expert_config
-        self.decoder = GenerativeDecoder(**decoder_config_with_expert)
+        self.config = config # 保存总配置
+        self.encoder = Hstu(**config['encoder_model'])
+        
+        # 将总配置传给解码器
+        self.decoder = GenerativeDecoder(config)
         
         encoder_dim = self.encoder.item_embedding.embedding_dim
         decoder_dim = self.decoder.embedding_dim
@@ -23,14 +23,15 @@ class GENIUSRecModel(nn.Module):
 
     def forward(self, source_ids, decoder_input_ids, source_padding_mask, **kwargs):
         """
-        【最终修复版】模型的前向传播。
-        严格区分source和target，彻底杜绝数据泄露。
+        【Sampled Softmax 修改版】模型的前向传播。
+        通过kwargs将 labels 和 negative_samples 传递给解码器。
         """
         encoder_output = self.encoder(source_ids)
         
         if self.encoder_projection is not None:
             encoder_output = self.encoder_projection(encoder_output)
         
+        # 将所有额外参数都传递给解码器
         return self.decoder(
             target_ids=decoder_input_ids,
             encoder_output=encoder_output,

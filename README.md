@@ -6,7 +6,7 @@
 
 ## 🎯 项目简介
 
-GENIUS-Rec是一个基于Transformer架构的生成式序列推荐系统，结合了多专家混合架构和多模态嵌入（文本+图像），能够为用户生成个性化的推荐序列。
+GENIUS-Rec是一个基于Transformer架构的生成式序列推荐系统，结合了多专家混合架构和多模态嵌入（文本+图像）。
 
 ### 主要特性
 
@@ -21,7 +21,7 @@ GENIUS-Rec是一个基于Transformer架构的生成式序列推荐系统，结�
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 [![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/Lanqiunian/genius_rec/blob/main/LICENSE)
 
-**GENIUS-Rec** 是一个旨在突破传统推荐范式局限的开源研究项目。它不仅仅预测用户可能点击的“下一个物品”，而是致力于成为一个能够理解用户多模态兴趣，并直接生成一个连贯、高质量推荐会话的推荐系统。
+**GENIUS-Rec** 是一个旨在突破传统推荐范式局限的开源研究项目。它不仅仅预测用户可能点击的“下一个物品”，而是致力于成为一个能够理解用户多模态兴趣的推荐系统。
 
 ---
 

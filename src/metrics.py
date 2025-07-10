@@ -166,7 +166,7 @@ def compute_hr_ndcg_batch(user_embeddings, all_item_embeddings, target_item_ids,
     # 4. 向量化计算排名
     target_indices = active_target_ids - special_token_offset
     target_scores = scores.gather(1, target_indices.unsqueeze(1))
-    rank = (scores >= target_scores).sum(dim=1)
+    rank = (scores > target_scores).sum(dim=1) + 1
 
     # 5. 计算每个有效样本的指标
     in_top_k = (rank <= k)
@@ -176,6 +176,7 @@ def compute_hr_ndcg_batch(user_embeddings, all_item_embeddings, target_item_ids,
     
     # NDCG结果
     ndcg_results = torch.zeros_like(hr_results)
+    # 仅对命中项计算NDCG
     ndcg_results[in_top_k] = 1.0 / torch.log2(rank[in_top_k].float() + 1)
 
     # 6. 将计算结果填充回原始batch对应的位置

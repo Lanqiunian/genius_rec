@@ -76,7 +76,7 @@ def get_config():
         "finetune": {
             "log_file": "finetune_genius_rec.log",
             "num_epochs": 50,
-            "batch_size": 4,
+            "batch_size": 32,
             "learning_rate": {
                 "decoder_lr": 1e-4,  # 解码器学习率, 建议: 3e-4 或 1e-4
                 "encoder_lr": 5e-6,  # 保持不变，用于精调
@@ -84,7 +84,7 @@ def get_config():
                 "gate_lr": 1e-4,      # 门控网络学习率
                 "expert_projection_lr": 1e-3 # 专家投影层学习率,目前考虑是设计得更大一些
             },
-            "balancing_loss_alpha": 0.1, # 负载均衡损失的系数, 建议: 0.01 或 0.05
+            "balancing_loss_alpha": 0.01, # 负载均衡损失的系数, 建议: 0.01 或 0.05
 
             "label_smoothing": 0,
             "warmup_steps": 1000,
@@ -95,10 +95,8 @@ def get_config():
             "stochastic_threshold": 20,
             "stochastic_prob": 0.5,
 
-            # 加入sampledsoftmax loss相关参数
-            "use_sampled_softmax": True,  # 开关
-            "num_neg_samples": 512,       # 负采样数量
-            "temperature": 0.05        # 温度参数
+            # 温度参数 (原Sampled Softmax温度)
+            "temperature": 0.2
               
         },
                 
@@ -125,7 +123,7 @@ def get_config():
                 "gate_type": "mlp",       # 门控类型：'simple', 'mlp'
                 "gate_hidden_dim": 64,       # MLP门控的隐藏层维度（仅gate_type='mlp'时使用）
                 "temperature": 1.0,          # softmax温度参数（预留）
-                "noise_epsilon": 1,         # 门控网络噪声参数，用于对抗专家极化
+                "noise_epsilon": 0.01,         # 门控网络噪声参数，用于对抗专家极化
             },
             
             # 内容专家配置

@@ -73,46 +73,25 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
         decoder_input_ids = batch['decoder_input_ids'].to(device)
         labels = batch['labels'].to(device)
         source_padding_mask = (source_ids == pad_token_id)
-        
-        # --- ↓↓↓ 新增/修改的代码: 获取负样本 ↓↓↓ ---
-        negative_samples = batch.get('negative_samples')
-        if use_sampled_softmax and negative_samples is not None:
-            negative_samples = negative_samples.to(device)
-        # --- ↑↑↑ 新增/修改的代码: 获取负样本 ↑↑↑ ---
+        # ↓↓↓ 添加下面这行关键代码 ↓↓↓
+        target_padding_mask = (decoder_input_ids == pad_token_id)
 
         optimizer.zero_grad()
 
         with torch.amp.autocast('cuda', enabled=(scaler is not None)):
-            # --- ↓↓↓ 新增/修改的代码: 调用新的模型接口 ↓↓↓ ---
+            # --- ↓↓↓ 新增/修改的代码: 调用新的模型接口 ↓↓↓
             # 传递所有需要的参数，让模型内部处理
             logits, gate_weights, balancing_loss, _ = model(
                 source_ids=source_ids,
                 decoder_input_ids=decoder_input_ids,
                 source_padding_mask=source_padding_mask,
-                # **kwargs 将包含以下内容
-                labels=labels,                     # 用于模型内部查找正样本嵌入
-                negative_samples=negative_samples, # 传递负样本
-                item_embedding_layer=model.encoder.item_embedding, # 传递共享的嵌入层
-                return_weights=True,
+                target_padding_mask=target_padding_mask, # 确保传入
+                item_embedding_layer=model.encoder.item_embedding, # 确保传入共享嵌入层
+                return_weights=True
             )
             
-            # --- ↓↓↓ 新增/修改的代码: 动态计算损失 ↓↓↓ ---
-            if use_sampled_softmax:
-                # 在Sampled Softmax模式下，正样本总是在第0位，所以目标是全0张量。
-                # logits 形状: [B, T, 1 + num_neg]
-                target_for_loss = torch.zeros_like(labels)
+            task_loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
                 
-                # 关键：只对非padding的位置计算损失
-                non_padding_mask = (labels.view(-1) != pad_token_id)
-                active_logits = logits.view(-1, logits.size(-1))[non_padding_mask]
-                active_target_for_loss = target_for_loss.view(-1)[non_padding_mask]
-
-                task_loss = criterion(active_logits, active_target_for_loss)
-            else:
-                # 保持原有的全量词汇表损失计算
-                task_loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
-            # --- ↑↑↑ 新增/修改的代码: 动态计算损失 ↑↑↑ ---
-
             if balancing_loss is not None:
                 loss = task_loss + balancing_loss_alpha * balancing_loss
                 bal_loss_item = balancing_loss.item()
@@ -252,8 +231,6 @@ def main():
     parser.add_argument('--disable_image_expert', action='store_true', help='Disable image expert.')
     parser.add_argument('--enable_image_expert', action='store_true', help='Enable image expert (requires image embeddings).')
     parser.add_argument('--image_embeddings_path', type=str, default=None, help='Path to image embeddings file.')
-    parser.add_argument('--full_evaluation', action='store_true', help='使用全量评估(与所有物品计算相似度)，与HSTU和baseline完全一致，但速度较慢。')
-    parser.add_argument('--sample_eval_size', type=int, default=500, help='采样评估的候选物品数量，默认为500，设为0使用全量评估。')
     parser.add_argument('--decoder_layers', type=int, default=None, help='Override decoder layers count for architecture experiments.')
     args = parser.parse_args()
 
@@ -308,9 +285,9 @@ def main():
     val_dataset = Seq2SeqRecDataset(config, config['data']['validation_file'], is_validation=True, item_maps=id_maps)
     test_dataset = ValidationDataset(config['data']['test_file'], config['encoder_model']['max_len'], config['pad_token_id'])
     
-    train_loader = DataLoader(train_dataset, batch_size=config['finetune']['batch_size'], shuffle=True, num_workers=config['finetune']['num_workers'])
-    val_loader = DataLoader(val_dataset, batch_size=config['finetune']['batch_size'], shuffle=False, num_workers=config['finetune']['num_workers'])
-    test_loader = DataLoader(test_dataset, batch_size=config['finetune']['batch_size'], shuffle=False, num_workers=config['finetune']['num_workers'])
+    train_loader = DataLoader(train_dataset, batch_size=config['finetune']['batch_size'], shuffle=True, num_workers=config['finetune']['num_workers'], pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=config['finetune']['batch_size'], shuffle=False, num_workers=config['finetune']['num_workers'], pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=config['finetune']['batch_size'], shuffle=False, num_workers=config['finetune']['num_workers'], pin_memory=True)
     pad_token_id = config['pad_token_id']
     top_k = config['evaluation']['top_k']
     logging.info(f"📊 Dataset Info: Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}, Test samples: {len(test_dataset)}")
@@ -464,11 +441,7 @@ def main():
                         logging.info("需要重新初始化模型以适配图像嵌入维度...")
                         
                         # 重新初始化模型
-                        model = GENIUSRecModel(
-                            config['encoder_model'], 
-                            config['decoder_model'],
-                            config['expert_system']
-                        ).to(device)
+                        model = GENIUSRecModel(config).to(device)
                         
                         # 重新加载编码器权重
                         if args.encoder_weights_path:
@@ -552,9 +525,9 @@ def main():
     logging.info("为模型不同部分设置差异化学习率...")
     
     # --- 权重绑定 (Tying Weights) ---
-    if model.decoder.final_projection is not None:
-        model.decoder.final_projection.weight = model.encoder.item_embedding.weight
-        logging.info("✅ [核心优化] 已成功绑定解码器输出层与编码器输入嵌入层的权重。")
+    # 权重绑定通过在解码器内部的forward函数中，使用F.linear(..., item_embedding_layer.weight)实现
+    # 因此无需在此处进行显式绑定，之前的 final_projection 层已被移除以避免混淆
+    logging.info("✅ [核心优化] 解码器输出与输入嵌入层权重已通过函数式调用绑定。")
 
     # --- 参数分组 (Parameter Grouping) ---
     
@@ -586,7 +559,8 @@ def main():
     gate_lr = config['finetune']['learning_rate'].get('gate_lr', 1e-4)
     encoder_lr = config['finetune']['learning_rate'].get('encoder_lr', 5e-6)
     # 【新增】为专家投影层设置一个更高的学习率
-    expert_projection_lr = config['finetune']['learning_rate'].get('expert_projection_lr', 5e-4) 
+    # 警告：原始配置中的学习率可能过高，导致模型发散。此处强制使用更安全的值。
+    expert_projection_lr = 1e-4 
 
     # 创建最终版的优化器实例
     optimizer = torch.optim.AdamW([
@@ -601,7 +575,7 @@ def main():
     logging.info(f"  - 解码器主干学习率: {decoder_lr}")
     logging.info(f"  - 共享嵌入层学习率: {embedding_lr}")
     logging.info(f"  - 门控网络学习率: {gate_lr}")
-    logging.info(f"  - 专家投影层学习率: {expert_projection_lr}")
+    logging.info(f"  - 专家投影层学习率: {expert_projection_lr} (已覆盖配置以保证稳定性)")
     logging.info(f"  - 编码器其他部分学习率: {encoder_lr}")
 
     # 损失函数定义 (保持不变)
@@ -639,11 +613,11 @@ def main():
             config['finetune']['num_epochs'], pad_token_id, config, scaler
         )
         
-        num_candidates = None if (args.full_evaluation or args.sample_eval_size == 0) else args.sample_eval_size
+
         eval_results = evaluate_model_validation_with_ranking(
             model, val_loader, criterion, device,
             epoch, config['finetune']['num_epochs'], pad_token_id,
-            config=config, num_candidates=num_candidates, top_k=top_k
+            config=config, top_k=top_k
         )
         
         current_val_loss = eval_results['val_loss']

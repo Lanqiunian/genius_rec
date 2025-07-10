@@ -57,9 +57,16 @@ def evaluate_model_validation(model, val_loader, criterion, device, pad_token_id
             decoder_input_ids = batch['decoder_input_ids'].to(device)
             labels = batch['labels'].to(device)
             source_padding_mask = (source_ids == pad_token_id)
-            
-            # 解包模型返回的三个值，但只使用第一个
-            logits, _, _ = model(source_ids, decoder_input_ids, source_padding_mask)
+            target_padding_mask = (decoder_input_ids == pad_token_id)
+
+            # 修复：传入共享嵌入层以解决ValueError
+            logits, _, _, _ = model(
+                source_ids=source_ids,
+                decoder_input_ids=decoder_input_ids,
+                source_padding_mask=source_padding_mask,
+                target_padding_mask=target_padding_mask,
+                item_embedding_layer=model.encoder.item_embedding
+            )
             
             loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
             num_tokens = (labels != pad_token_id).sum().item()
@@ -101,6 +108,7 @@ def evaluate_model_validation_with_ranking(model, val_loader, criterion, device,
             decoder_input_ids = batch['decoder_input_ids'].to(device)
             labels = batch['labels'].to(device)
             source_padding_mask = (source_ids == pad_token_id)
+            target_padding_mask = (decoder_input_ids == pad_token_id) # 修复：添加缺失的mask
             batch_size = source_ids.size(0)
 
             # --- Loss 计算 (基于解码器) ---
@@ -109,6 +117,8 @@ def evaluate_model_validation_with_ranking(model, val_loader, criterion, device,
                 source_ids=source_ids,
                 decoder_input_ids=decoder_input_ids,
                 source_padding_mask=source_padding_mask,
+                target_padding_mask=target_padding_mask, # 确保传入
+                item_embedding_layer=model.encoder.item_embedding, # 修复：传入共享嵌入层
                 return_weights=True
             )
             task_loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
@@ -136,11 +146,11 @@ def evaluate_model_validation_with_ranking(model, val_loader, criterion, device,
             # 1. 获取用户画像：只将历史前缀(source_ids)送入编码器
             encoder_outputs = model.encoder(source_ids)
             
-            # 使用历史前缀的最后一个非填充token的表征作为用户画像
+            # 使用历史前缀的最后一个非填充token的表征作为用户画像 (增加鲁棒性)
             source_lengths = (source_ids != pad_token_id).sum(dim=1)
-            embedding_dim = model.encoder.item_embedding.embedding_dim
-            last_item_indices = (source_lengths - 1).view(-1, 1, 1).expand(-1, -1, embedding_dim)
-            user_embeddings = encoder_outputs.gather(1, last_item_indices).squeeze(1)
+            # 使用clamp(min=0)防止空序列导致索引为-1，并采用更简洁的索引方式
+            last_item_indices = (source_lengths - 1).clamp(min=0)
+            user_embeddings = encoder_outputs[torch.arange(batch_size), last_item_indices]
 
             # 2. 获取评估目标：目标是未来后缀的第一个物品
             #    它在labels张量的第0个位置
@@ -195,9 +205,16 @@ def evaluate_model_test(model, test_loader, device, item_num, top_k=10, config=N
             ground_truth_ids = batch['ground_truth'].to(device)
             batch_size = input_ids.size(0)
             encoder_output = model.encoder(input_ids)
-            user_embeddings = encoder_output[:, -1, :]
             
-            hr, ndcg = compute_hr_ndcg_full(user_embeddings, all_item_embeddings, ground_truth_ids, k=top_k)
+            # --- 【核心修复】获取最后一个有效物品的表征作为用户画像 ---
+            # 1. 计算每个序列的真实长度
+            source_lengths = (input_ids != (config['pad_token_id'] if config else 0)).sum(dim=1)
+            # 2. 获取最后一个物品的索引
+            last_item_indices = (source_lengths - 1).clamp(min=0) # clamp以防空序列
+            # 3. 从编码器输出中提取对应的表征
+            user_embeddings = encoder_output[torch.arange(encoder_output.size(0)), last_item_indices]
+            
+            hr, ndcg = compute_hr_ndcg_full(user_embeddings, all_item_embeddings, ground_truth_ids, k=top_k, special_token_offset=num_special_tokens)
             
             hr_total += hr * batch_size
             ndcg_total += ndcg * batch_size

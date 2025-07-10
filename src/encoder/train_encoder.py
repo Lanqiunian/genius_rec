@@ -338,8 +338,8 @@ def train():
         with torch.no_grad():
             # 预计算所有物品的嵌入，提高效率
             logging.info("预计算物品嵌入向量...")
-            # 修复：使用从4开始的物品ID（跳过所有特殊标记0,1,2,3）
-            all_item_ids = torch.arange(4, item_num, device=device)
+            # 修复：使用从4开始的物品ID（跳过所有特殊标记0,1,2,3），并包含所有物品
+            all_item_ids = torch.arange(4, item_num + 4, device=device)
             all_item_embeddings = model.item_embedding(all_item_ids)
             # 预先L2归一化，避免重复计算
             all_item_embeddings = F.normalize(all_item_embeddings, p=2, dim=1)
@@ -424,8 +424,8 @@ def train():
         with torch.no_grad():
             # 预计算所有物品的嵌入，提高效率
             logging.info("预计算测试集评估所需的物品嵌入向量...")
-            # 修复：使用从4开始的物品ID（跳过所有特殊标记0,1,2,3）
-            all_item_ids = torch.arange(4, item_num, device=device)
+            # 修复：使用从4开始的物品ID（跳过所有特殊标记0,1,2,3），并包含所有物品
+            all_item_ids = torch.arange(4, item_num + 4, device=device)
             all_item_embeddings = model.item_embedding(all_item_ids)
             # 预先L2归一化，避免重复计算
             all_item_embeddings = F.normalize(all_item_embeddings, p=2, dim=1)

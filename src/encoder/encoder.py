@@ -213,7 +213,7 @@ class Hstu(nn.Module):
         # 通过HSTU层
         encoded_seq = input_emb
         for layer in self.encoder_layers:
-            encoded_seq = checkpoint(layer, encoded_seq, rel_pos_bias, invalid_attn_mask, use_reentrant=False)
+            encoded_seq = layer(encoded_seq, rel_pos_bias, invalid_attn_mask)
         
         # 最终归一化
         encoded_seq = self.final_norm(encoded_seq)

@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 from src.encoder.encoder import Hstu
-from src.decoder.decoder_sampled_softmax import GenerativeDecoder # 假设新的解码器在此文件
+from src.decoder.decoder import GenerativeDecoder # 假设新的解码器在此文件
 
 class GENIUSRecModel(nn.Module):
     def __init__(self, config): # 简化构造函数，直接传入总配置
@@ -21,7 +21,7 @@ class GENIUSRecModel(nn.Module):
         else:
             self.encoder_projection = None
 
-    def forward(self, source_ids, decoder_input_ids, source_padding_mask, **kwargs):
+    def forward(self, source_ids, decoder_input_ids, source_padding_mask, target_padding_mask, **kwargs):
         """
         【Sampled Softmax 修改版】模型的前向传播。
         通过kwargs将 labels 和 negative_samples 传递给解码器。
@@ -36,5 +36,6 @@ class GENIUSRecModel(nn.Module):
             target_ids=decoder_input_ids,
             encoder_output=encoder_output,
             memory_padding_mask=source_padding_mask,
+            target_padding_mask=target_padding_mask,
             **kwargs
         )

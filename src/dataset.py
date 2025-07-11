@@ -1,12 +1,4 @@
-# src/dataset.py (最终修复版：随机分割的前缀预测后缀)
-
-import pandas as pd
-import numpy as np
-import torch
-import random
-from torch.utils.data import Dataset
-
-# src/dataset.py (修改版)
+# src/dataset.py (已修复)
 
 import pandas as pd
 import numpy as np
@@ -32,8 +24,8 @@ class Seq2SeqRecDataset(Dataset):
 
     def __getitem__(self, idx):
         full_seq = self.data.iloc[idx]['history']
-
-        # --- 序列分割逻辑 (保持不变) ---
+        
+        # --- 序列分割逻辑 ---
         if self.is_validation:
             split_point = len(full_seq) - 1
         else:
@@ -45,19 +37,23 @@ class Seq2SeqRecDataset(Dataset):
         source_seq = full_seq[:split_point]
         target_seq = full_seq[split_point:]
 
-        # --- 截断与填充 (保持不变) ---
+        # --- 截断与填充 (源序列) ---
         if len(source_seq) > self.max_len:
             source_seq = source_seq[-self.max_len:]
         source_ids = np.full(self.max_len, self.pad_token_id, dtype=np.int64)
         source_ids[:len(source_seq)] = source_seq
 
-        decoder_input_seq = [self.sos_token_id] + target_seq
+        # --- 解码器输入和标签的构建 (关键修复) ---
+        
+        # 修复 1: 将 NumPy 数组转换为列表再拼接
+        decoder_input_seq = [self.sos_token_id] + list(target_seq)
         if len(decoder_input_seq) > self.max_len:
             decoder_input_seq = decoder_input_seq[:self.max_len]
         decoder_input_ids = np.full(self.max_len, self.pad_token_id, dtype=np.int64)
         decoder_input_ids[:len(decoder_input_seq)] = decoder_input_seq
 
-        labels_seq = target_seq + [self.eos_token_id]
+        # 修复 2: 将 NumPy 数组转换为列表再拼接
+        labels_seq = list(target_seq) + [self.eos_token_id]
         if len(labels_seq) > self.max_len:
             labels_seq = labels_seq[:self.max_len]
         labels = np.full(self.max_len, self.pad_token_id, dtype=np.int64)

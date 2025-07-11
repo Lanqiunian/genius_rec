@@ -52,7 +52,7 @@ def get_config():
             "num_layers": 4,
             "num_heads": 4,
             "ffn_hidden_dim": 64 * 4,    # 建议随 embedding_dim 调整, e.g., 128 * 4
-            "dropout_ratio": 0.2,        # 建议: 0.1 或 0.2
+            "dropout_ratio": 0.1,        # 建议: 0.1 或 0.2
         },
 
         # =================================================================
@@ -67,7 +67,7 @@ def get_config():
             "learning_rate": 1e-3,
             "weight_decay": 0.1,
             "early_stopping_patience": 20,
-            "num_workers": 10,
+            "num_workers": 0,
             "num_neg_samples": 512, # 负采样数量
             "temperature": 0.05,    # Sampled Softmax温度
         },
@@ -79,10 +79,10 @@ def get_config():
             "batch_size": 32,
             "learning_rate": {
                 "decoder_lr": 1e-4,  # 解码器学习率, 建议: 3e-4 或 1e-4
-                "encoder_lr": 5e-6,  # 保持不变，用于精调
+                "encoder_lr": 2e-5,  # 保持不变，用于精调
                 "embedding_lr": 1e-4, # 嵌入层学习率, 建议: 1e-4 或 3e-4
                 "gate_lr": 1e-4,      # 门控网络学习率
-                "expert_projection_lr": 1e-3 # 专家投影层学习率,目前考虑是设计得更大一些
+                "expert_projection_lr": 1e-4 # 专家投影层学习率，将专家投影到解码器嵌入空间
             },
             "balancing_loss_alpha": 0.01, # 负载均衡损失的系数, 建议: 0.01 或 0.05
 
@@ -90,7 +90,7 @@ def get_config():
             "warmup_steps": 1000,
             "weight_decay": 0.01,    
             "early_stopping_patience": 4,
-            "num_workers": 10,
+            "num_workers": 0,
             "use_stochastic_length": False,
             "stochastic_threshold": 20,
             "stochastic_prob": 0.5,
@@ -122,8 +122,7 @@ def get_config():
             "gate_config": {
                 "gate_type": "mlp",       # 门控类型：'simple', 'mlp'
                 "gate_hidden_dim": 64,       # MLP门控的隐藏层维度（仅gate_type='mlp'时使用）
-                "temperature": 1.0,          # softmax温度参数（预留）
-                "noise_epsilon": 0.01,         # 门控网络噪声参数，用于对抗专家极化
+                "noise_epsilon": 0.1,         # 门控网络噪声参数，用于对抗专家极化
             },
             
             # 内容专家配置

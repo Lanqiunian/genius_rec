@@ -45,40 +45,7 @@ class ValidationDataset(Dataset):
             'ground_truth': torch.tensor(ground_truth_item, dtype=torch.long)
         }
 
-def evaluate_model_validation(model, val_loader, criterion, device, pad_token_id):
-    """
-    【最终版】验证集评估：仅计算loss和perplexity。
-    """
-    model.eval()
-    total_loss, total_tokens = 0.0, 0
-    with torch.no_grad():
-        for batch in val_loader:
-            source_ids = batch['source_ids'].to(device)
-            decoder_input_ids = batch['decoder_input_ids'].to(device)
-            labels = batch['labels'].to(device)
-            source_padding_mask = (source_ids == pad_token_id)
-            target_padding_mask = (decoder_input_ids == pad_token_id)
 
-            # 修复：传入共享嵌入层以解决ValueError
-            logits, _, _, _ = model(
-                source_ids=source_ids,
-                decoder_input_ids=decoder_input_ids,
-                source_padding_mask=source_padding_mask,
-                target_padding_mask=target_padding_mask,
-                item_embedding_layer=model.encoder.item_embedding
-            )
-            
-            loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
-            num_tokens = (labels != pad_token_id).sum().item()
-            
-            if num_tokens > 0:
-                total_loss += loss.item() * num_tokens
-                total_tokens += num_tokens
-
-    avg_loss = total_loss / total_tokens if total_tokens > 0 else 0
-    perplexity = math.exp(avg_loss) if avg_loss > 0 and avg_loss < 20 else float('inf')
-    
-    return {'val_loss': avg_loss, 'val_ppl': perplexity}
 
 
 def evaluate_model_validation_with_ranking(model, val_loader, criterion, device, epoch, num_epochs, pad_token_id, config, top_k=10, **kwargs):

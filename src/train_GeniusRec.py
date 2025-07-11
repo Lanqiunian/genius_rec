@@ -9,6 +9,10 @@ import pathlib
 import platform
 from pathlib import Path
 
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1" # For precise error localization
+
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1" # For precise error localization
+
 from tqdm import tqdm
 from transformers import get_linear_schedule_with_warmup
 import numpy as np
@@ -23,7 +27,6 @@ from src.GeniusRec import GENIUSRecModel
 from src.dataset import Seq2SeqRecDataset
 from src.unified_evaluation import (
     ValidationDataset, 
-    evaluate_model_validation, 
     evaluate_model_test, 
     evaluate_model_validation_with_ranking
 )
@@ -52,41 +55,30 @@ from src.decoder.decoder import GenerativeDecoder
 
 
 def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, epoch, num_epochs, pad_token_id, config, scaler=None):
-    """
-    【Sampled Softmax 最终修改版】训练一个epoch。
-    - 适配“随机分割的前缀预测后缀”数据模式。
-    - 动态处理Sampled Softmax和全量词汇表两种训练模式。
-    """
+    """训练一个epoch的循环。"""
     model.train()
     total_loss_value = 0.0
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Training]", leave=True)
 
-    # --- ↓↓↓ 新增/修改的代码 ↓↓↓ ---
-    # 从配置中获取训练参数
     balancing_loss_alpha = config['finetune'].get('balancing_loss_alpha', 0.01)
-    use_sampled_softmax = config['finetune'].get('use_sampled_softmax', False)
-    # --- ↑↑↑ 新增/修改的代码 ↑↑↑ ---
 
     for batch_idx, batch in enumerate(progress_bar):
-        # --- 数据准备 ---
         source_ids = batch['source_ids'].to(device)
         decoder_input_ids = batch['decoder_input_ids'].to(device)
         labels = batch['labels'].to(device)
+        
         source_padding_mask = (source_ids == pad_token_id)
-        # ↓↓↓ 添加下面这行关键代码 ↓↓↓
         target_padding_mask = (decoder_input_ids == pad_token_id)
 
         optimizer.zero_grad()
 
         with torch.amp.autocast('cuda', enabled=(scaler is not None)):
-            # --- ↓↓↓ 新增/修改的代码: 调用新的模型接口 ↓↓↓
-            # 传递所有需要的参数，让模型内部处理
             logits, gate_weights, balancing_loss, _ = model(
                 source_ids=source_ids,
                 decoder_input_ids=decoder_input_ids,
                 source_padding_mask=source_padding_mask,
-                target_padding_mask=target_padding_mask, # 确保传入
-                item_embedding_layer=model.encoder.item_embedding, # 确保传入共享嵌入层
+                target_padding_mask=target_padding_mask,
+                item_embedding_layer=model.encoder.item_embedding,
                 return_weights=True
             )
             
@@ -99,7 +91,6 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
                 loss = task_loss
                 bal_loss_item = 0.0
 
-        # --- 优化器和梯度裁剪 (逻辑不变) ---
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -116,7 +107,6 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
         
         total_loss_value += loss.item()
         
-        # --- 日志记录 (逻辑不变) ---
         if gate_weights is not None:
             enabled_experts = [k for k, v in model.decoder.expert_config["experts"].items() if v]
             weights_postfix = {}
@@ -244,7 +234,7 @@ def main():
     # Override decoder layers if specified
     if args.decoder_layers is not None:
         config['decoder_model']['num_layers'] = args.decoder_layers
-        logging.info(f"🏗️ 覆盖解码器层数设置为: {args.decoder_layers}")
+        logging.info(f"Overriding decoder layers to: {args.decoder_layers}")
 
     # 2. 环境设置
     device = torch.device(config['device'])
@@ -275,10 +265,10 @@ def main():
     config['encoder_model']['item_num'] = total_vocab_size
     config['decoder_model']['num_items'] = total_vocab_size
     num_items = total_vocab_size
-    logging.info(f"📊 Vocabulary Info: Total vocabulary size: {total_vocab_size}")
+    logging.info(f"Vocabulary Size: {total_vocab_size}")
     enabled_experts = [k for k, v in config['expert_system']['experts'].items() if v]
-    if not enabled_experts: raise ValueError("❌ 至少需要启用一个专家！")
-    logging.info(f"🧠 已启用专家: {enabled_experts}")
+    if not enabled_experts: raise ValueError("At least one expert must be enabled!")
+    logging.info(f"Enabled experts: {enabled_experts}")
 
     # 【核心修改】创建Dataset时传入id_maps
     train_dataset = Seq2SeqRecDataset(config, config['data']['train_file'], is_validation=False, item_maps=id_maps)
@@ -290,7 +280,7 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=config['finetune']['batch_size'], shuffle=False, num_workers=config['finetune']['num_workers'], pin_memory=True)
     pad_token_id = config['pad_token_id']
     top_k = config['evaluation']['top_k']
-    logging.info(f"📊 Dataset Info: Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}, Test samples: {len(test_dataset)}")
+    logging.info(f"Dataset Info: Train={len(train_dataset)}, Val={len(val_dataset)}, Test={len(test_dataset)}")
 
 
     # 5. 文本嵌入加载
@@ -520,14 +510,6 @@ def main():
         # 兼容旧版本PyTorch
         scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
     
-# 9. 优化器和损失函数 (最终版：包含独立的专家投影层学习率)
-    # =================================================================
-    logging.info("为模型不同部分设置差异化学习率...")
-    
-    # --- 权重绑定 (Tying Weights) ---
-    # 权重绑定通过在解码器内部的forward函数中，使用F.linear(..., item_embedding_layer.weight)实现
-    # 因此无需在此处进行显式绑定，之前的 final_projection 层已被移除以避免混淆
-    logging.info("✅ [核心优化] 解码器输出与输入嵌入层权重已通过函数式调用绑定。")
 
     # --- 参数分组 (Parameter Grouping) ---
     
@@ -560,7 +542,7 @@ def main():
     encoder_lr = config['finetune']['learning_rate'].get('encoder_lr', 5e-6)
     # 【新增】为专家投影层设置一个更高的学习率
     # 警告：原始配置中的学习率可能过高，导致模型发散。此处强制使用更安全的值。
-    expert_projection_lr = 1e-4 
+    expert_projection_lr = config['finetune']['learning_rate'].get('expert_projection_lr', 1e-4)
 
     # 创建最终版的优化器实例
     optimizer = torch.optim.AdamW([
@@ -575,7 +557,7 @@ def main():
     logging.info(f"  - 解码器主干学习率: {decoder_lr}")
     logging.info(f"  - 共享嵌入层学习率: {embedding_lr}")
     logging.info(f"  - 门控网络学习率: {gate_lr}")
-    logging.info(f"  - 专家投影层学习率: {expert_projection_lr} (已覆盖配置以保证稳定性)")
+    logging.info(f"  - 专家投影层学习率: {expert_projection_lr}")
     logging.info(f"  - 编码器其他部分学习率: {encoder_lr}")
 
     # 损失函数定义 (保持不变)

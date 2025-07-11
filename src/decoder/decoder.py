@@ -44,20 +44,18 @@ class DecoderBlock(nn.Module):
 
 class GenerativeDecoder(nn.Module):
     """
-    【Sampled Softmax 修改版】生成式解码器
-    - 在训练时，根据配置动态切换到Sampled Softmax损失计算。
-    - 在评估时，保持原有的全词汇表输出，确保评估逻辑不变。
+    生成式解码器，集成了混合专家（MoE）系统。
+    它接收编码器的输出和目标序列，并生成对下一个物品的预测。
     """
-    def __init__(self, config: dict): # 接收总配置
+    def __init__(self, config: dict):
         super(GenerativeDecoder, self).__init__()
         
-        # --- ↓↓↓ 新增/修改的代码 ↓↓↓ ---
         self.config = config
         self.decoder_config = config['decoder_model']
         self.expert_config = config.get('expert_system', {"experts": {}})
         self.finetune_config = config['finetune']
         
-        # 从配置中获取参数
+        # 从配置中获取核心参数
         num_items = self.decoder_config['num_items']
         embedding_dim = self.decoder_config['embedding_dim']
         num_layers = self.decoder_config['num_layers']
@@ -66,9 +64,7 @@ class GenerativeDecoder(nn.Module):
         max_seq_len = self.decoder_config['max_seq_len']
         dropout_ratio = self.decoder_config['dropout_ratio']
         pad_token_id = config['pad_token_id']
-        # --- ↑↑↑ 新增/修改的代码 ↑↑↑ ---
 
-        self.item_embedding = nn.Embedding(num_items, embedding_dim, padding_idx=pad_token_id)
         self.pos_embedding = nn.Embedding(max_seq_len, embedding_dim)
         self.decoder_layers = nn.ModuleList(
             [DecoderBlock(embedding_dim, num_heads, ffn_hidden_dim, dropout_ratio) for _ in range(num_layers)]
@@ -80,9 +76,9 @@ class GenerativeDecoder(nn.Module):
         self.enabled_experts = [k for k, v in self.expert_config["experts"].items() if v]
         num_experts = len(self.enabled_experts)
         if num_experts == 0: raise ValueError("At least one expert must be enabled!")
-        print(f"🧠 [Sampled Softmax Ready] Enabled Experts: {self.enabled_experts}")
+        print(f"Enabled Experts: {self.enabled_experts}")
 
-        # --- 专家和门控网络定义 (修复版：支持可配置的投影层) ---
+        # --- 专家与门控网络定义 ---
         if "behavior_expert" in self.enabled_experts:
             self.behavior_expert_projection = nn.Linear(embedding_dim, embedding_dim)
 
@@ -123,6 +119,7 @@ class GenerativeDecoder(nn.Module):
             self.image_attention = nn.MultiheadAttention(embedding_dim, image_config["attention_heads"], dropout=dropout_ratio, batch_first=True)
             self.image_expert_projection = nn.Sequential(nn.Linear(embedding_dim, embedding_dim * 2), nn.ReLU(), nn.Dropout(dropout_ratio), nn.Linear(embedding_dim * 2, embedding_dim))
             self.register_buffer('image_embedding_matrix', torch.zeros(1, 1))
+        
         gate_config = self.expert_config.get("gate_config", {})
         gate_type = gate_config.get("gate_type", "mlp")
         self.gate_noise_epsilon = gate_config.get("noise_epsilon", 0.1)
@@ -132,7 +129,6 @@ class GenerativeDecoder(nn.Module):
         else:
             self.gate_network = nn.Linear(embedding_dim, num_experts)
         
-        # 修复：添加最终输出前的归一化层
         self.final_hidden_norm = nn.LayerNorm(embedding_dim)
 
     def load_text_embeddings(self, embedding_matrix: torch.Tensor, verbose: bool = True):
@@ -143,8 +139,7 @@ class GenerativeDecoder(nn.Module):
 
     @staticmethod
     def _generate_square_subsequent_mask(sz: int):
-        # 官方推荐的布尔类型mask
-        # True值表示该位置将被忽略
+        """生成一个上三角矩阵，用于在自注意力中屏蔽未来的token。"""
         mask = torch.triu(torch.ones(sz, sz, dtype=torch.bool), diagonal=1)
         return mask
 
@@ -153,7 +148,7 @@ class GenerativeDecoder(nn.Module):
         if item_embedding_layer is None:
             raise ValueError("The shared 'item_embedding_layer' must be provided.")
             
-        # 步骤 1 & 2: 主解码流程和专家计算 (此部分保持不变)
+        # 1. 主解码器流程
         batch_size, target_len = target_ids.size()
         positions = torch.arange(0, target_len, device=target_ids.device).unsqueeze(0)
         target_emb = item_embedding_layer(target_ids) * math.sqrt(self.embedding_dim)
@@ -163,14 +158,18 @@ class GenerativeDecoder(nn.Module):
         hidden_state = decoder_input
         for layer in self.decoder_layers:
             hidden_state = layer(hidden_state, encoder_output, target_mask, memory_padding_mask, target_padding_mask)
+        
+        # 2. 混合专家（MoE）计算
         gate_logits = self.gate_network(hidden_state)
         if self.training and self.gate_noise_epsilon > 0:
             gate_logits += torch.randn_like(gate_logits) * self.gate_noise_epsilon
         expert_weights = F.softmax(gate_logits, dim=-1).unsqueeze(-1)
+        
         balancing_loss = torch.tensor(0.0, device=target_ids.device)
-        if self.training and self.expert_config.get("gate_config", {}).get("balancing_loss_alpha", 0) > 0: # 检查是否启用
+        if self.training and self.finetune_config.get("balancing_loss_alpha", 0) > 0: # 检查是否启用
             avg_probs_per_expert = expert_weights.squeeze(-1).mean(dim=(0, 1))
             balancing_loss = len(self.enabled_experts) * torch.sum(avg_probs_per_expert.pow(2))
+        
         expert_outputs = []
         if "behavior_expert" in self.enabled_experts:
             expert_outputs.append(self.behavior_expert_projection(hidden_state))
@@ -184,19 +183,19 @@ class GenerativeDecoder(nn.Module):
             projected_image_history_emb = self.image_embedding_projection(image_history_emb)
             image_context, _ = self.image_attention(query=hidden_state, key=projected_image_history_emb, value=projected_image_history_emb)
             expert_outputs.append(self.image_expert_projection(image_context))
+        
         stacked_expert_outputs = torch.stack(expert_outputs, dim=2)
         final_hidden_state = (expert_weights * stacked_expert_outputs).sum(dim=2)
         
-        # --- 步骤 3: 【最终的、内存安全的】输出层 ---
-        # 首先，将最终的隐状态通过共享的嵌入层权重投影到整个词汇表的 logits 空间
+        # 3. 输出层
+        # 使用共享的嵌入层权重进行线性变换，实现权重绑定
         full_logits = F.linear(self.final_hidden_norm(final_hidden_state), item_embedding_layer.weight)
 
-        # 在训练时应用温度参数，以平滑输出
+        # 在训练时应用温度参数以平滑输出
         if self.training:
-            temperature = self.finetune_config.get('temperature', 1.0) # 从配置读取温度
+            temperature = self.finetune_config.get('temperature', 1.0)
             full_logits = full_logits / temperature
 
-        # 评估/推理模式下，直接使用原始logits
         final_logits = full_logits
         
         weights_to_return = expert_weights.squeeze(-1) if return_weights else None
